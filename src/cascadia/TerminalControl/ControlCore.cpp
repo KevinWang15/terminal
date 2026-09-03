@@ -435,7 +435,9 @@ namespace winrt::Microsoft::Terminal::Control::implementation
                                           Utils::ClampToShortMax(height, 1) };
 
             const auto historySize = _settings.HistorySize();
-            _terminal->Create(viewportSize, historySize == -1 ? -1 : Utils::ClampToShortMax(historySize, 0), *_renderer);
+            _terminal->Create(viewportSize,
+                              historySize == UNLIMITED_HISTORY_SIZE ? UNLIMITED_HISTORY_SIZE : Utils::ClampToShortMax(historySize, 0),
+                              *_renderer);
             _terminal->UpdateSettings(_settings);
 
             // Tell the render engine to notify us when the swap chain changes.
@@ -1764,15 +1766,13 @@ namespace winrt::Microsoft::Terminal::Control::implementation
     }
 
     // Method Description:
-    // - Search text in text buffer. This is triggered if the user click
-    //   search button or press enter.
+    // - Searches the text buffer and optionally moves to the next match. Explicit
+    //   requests always scan the full retained history. Output-idle refreshes are
+    //   skipped once a growable buffer exceeds the bounded automatic-search limit.
     // Arguments:
-    // - text: the text to search
-    // - goForward: boolean that represents if the current search direction is forward
-    // - caseSensitive: boolean that represents if the current search is case-sensitive
-    // - resetOnly: If true, only Reset() will be called, if anything. FindNext() will never be called.
+    // - request: The search criteria, action, and origin.
     // Return Value:
-    // - <none>
+    // - The current match counts and whether results were invalidated or left stale.
     SearchResults ControlCore::Search(const SearchRequest& request)
     {
         const auto lock = _terminal->LockForWriting();
@@ -1781,6 +1781,36 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         WI_SetFlagIf(flags, SearchFlag::CaseInsensitive, !request.CaseSensitive);
         WI_SetFlagIf(flags, SearchFlag::RegularExpression, request.RegularExpression);
         const auto searchInvalidated = _searcher.IsStale(*_terminal.get(), request.Text, flags);
+        const auto& textBuffer = _terminal->GetTextBuffer();
+        const auto skipPassiveSearch = request.Origin == SearchRequestOrigin::OutputIdle &&
+                                       searchInvalidated &&
+                                       textBuffer.IsGrowable() &&
+                                       textBuffer.TotalRowCount() > _maximumRowsForPassiveSearch;
+
+        if (skipPassiveSearch)
+        {
+            // Output can invalidate search results every few milliseconds. Re-running
+            // a full search after every idle notification would hold the terminal write
+            // lock for an unbounded amount of time. Remove the now-stale highlights and
+            // wait for the next explicit search action instead.
+            if (const auto current = _searcher.GetCurrent())
+            {
+                _staleSearchAnchor = *current;
+            }
+            auto oldResults = _searcher.ExtractResults();
+            _searcher = {};
+            _terminal->SetSearchHighlights({});
+            _terminal->SetSearchHighlightFocused(0);
+            _renderer->TriggerSearchHighlight(oldResults);
+
+            return {
+                .TotalMatches = 0,
+                .CurrentMatch = 0,
+                .SearchInvalidated = true,
+                .SearchRegexInvalid = false,
+                .SearchResultsStale = true,
+            };
+        }
 
         if (searchInvalidated || request.ExecuteSearch)
         {
@@ -1790,6 +1820,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
             {
                 oldResults = _searcher.ExtractResults();
                 _searcher.Reset(*_terminal.get(), request.Text, flags, !request.GoForward);
+                if (_staleSearchAnchor)
+                {
+                    _searcher.MoveToPoint(request.GoForward ? _staleSearchAnchor->start : _staleSearchAnchor->end);
+                    _staleSearchAnchor.reset();
+                }
                 _terminal->SetSearchHighlights(_searcher.Results());
             }
 
@@ -1820,6 +1855,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
             .CurrentMatch = currentMatch,
             .SearchInvalidated = searchInvalidated,
             .SearchRegexInvalid = !_searcher.IsOk(),
+            .SearchResultsStale = false,
         };
     }
 
@@ -1849,6 +1885,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         _terminal->SetSearchHighlightFocused(0);
         _renderer->TriggerSearchHighlight(_searcher.Results());
         _searcher = {};
+        _staleSearchAnchor.reset();
     }
 
     void ControlCore::Close()

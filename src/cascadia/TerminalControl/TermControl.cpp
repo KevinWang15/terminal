@@ -705,7 +705,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
                     {
                         self->_searchScrollOffset = self->_calculateSearchScrollOffset();
                         self->_searchBox->SetFocusOnTextbox();
-                        self->_refreshSearch();
+                        self->_refreshSearch(SearchRequestOrigin::Explicit);
                     }
                 });
             }
@@ -733,6 +733,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
                 .ExecuteSearch = true,
                 .ScrollIntoView = true,
                 .ScrollOffset = _searchScrollOffset,
+                .Origin = SearchRequestOrigin::Explicit,
             }));
         }
     }
@@ -775,6 +776,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
                 .ExecuteSearch = true,
                 .ScrollIntoView = true,
                 .ScrollOffset = _searchScrollOffset,
+                .Origin = SearchRequestOrigin::Explicit,
             }));
         }
     }
@@ -802,6 +804,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
                 .ExecuteSearch = false,
                 .ScrollIntoView = true,
                 .ScrollOffset = _searchScrollOffset,
+                .Origin = SearchRequestOrigin::Explicit,
             }));
         }
     }
@@ -3779,7 +3782,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         return _core.SelectedText(trimTrailingWhitespace);
     }
 
-    void TermControl::_refreshSearch()
+    void TermControl::_refreshSearch(const SearchRequestOrigin origin)
     {
         if (!_searchBox || !_searchBox->IsOpen())
         {
@@ -3803,6 +3806,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
             .ExecuteSearch = false,
             .ScrollIntoView = false,
             .ScrollOffset = _searchScrollOffset,
+            .Origin = origin,
         }));
     }
 
@@ -3814,7 +3818,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         }
 
         // Only show status when we have a search term
-        if (_searchBox->Text().empty())
+        if (_searchBox->Text().empty() || results.SearchResultsStale)
         {
             _searchBox->ClearStatus();
         }
@@ -3838,23 +3842,26 @@ namespace winrt::Microsoft::Terminal::Control::implementation
             }
         }
 
-        if (auto automationPeer{ FrameworkElementAutomationPeer::FromElement(*this) })
+        if (!results.SearchResultsStale)
         {
-            const auto status = _searchBox->GetAccessibleStatus(results.TotalMatches, results.CurrentMatch, results.SearchRegexInvalid);
-            if (!status.empty())
+            if (auto automationPeer{ FrameworkElementAutomationPeer::FromElement(*this) })
             {
-                automationPeer.RaiseNotificationEvent(
-                    AutomationNotificationKind::ActionCompleted,
-                    AutomationNotificationProcessing::ImportantMostRecent,
-                    status,
-                    L"SearchBoxResultAnnouncement" /* unique name for this group of notifications */);
+                const auto status = _searchBox->GetAccessibleStatus(results.TotalMatches, results.CurrentMatch, results.SearchRegexInvalid);
+                if (!status.empty())
+                {
+                    automationPeer.RaiseNotificationEvent(
+                        AutomationNotificationKind::ActionCompleted,
+                        AutomationNotificationProcessing::ImportantMostRecent,
+                        status,
+                        L"SearchBoxResultAnnouncement" /* unique name for this group of notifications */);
+                }
             }
         }
     }
 
     void TermControl::_coreOutputIdle(const IInspectable& /*sender*/, const IInspectable& /*args*/)
     {
-        _refreshSearch();
+        _refreshSearch(SearchRequestOrigin::OutputIdle);
     }
 
     void TermControl::OwningHwnd(uint64_t owner)

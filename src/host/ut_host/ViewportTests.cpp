@@ -598,6 +598,34 @@ class ViewportTests
         VERIFY_ARE_EQUAL(-1, v.CompareInBounds(second, first), L"Reverse params, should get opposite direction, same magnitude.");
     }
 
+    TEST_METHOD(GetCellDistanceLargeCoordinates)
+    {
+        constexpr til::CoordType width = 3;
+        constexpr til::CoordType height = 1'000'000'000;
+        constexpr til::HugeCoordType expectedDistance = static_cast<til::HugeCoordType>(width) * height;
+        const auto v = Viewport::FromDimensions({}, { width, height });
+
+        const auto begin = v.Origin();
+        const auto end = v.EndExclusive();
+
+        VERIFY_IS_GREATER_THAN(expectedDistance, static_cast<til::HugeCoordType>(INT_MAX));
+        VERIFY_ARE_EQUAL(expectedDistance, v.GetCellDistance(begin, end, true));
+        VERIFY_ARE_EQUAL(-expectedDistance, v.GetCellDistance(end, begin, true));
+
+        // CompareInBounds remains an int-sized, sign-compatible API.
+        VERIFY_ARE_EQUAL(INT_MIN, v.CompareInBounds(begin, end, true));
+        VERIFY_ARE_EQUAL(INT_MAX, v.CompareInBounds(end, begin, true));
+    }
+
+    TEST_METHOD(WalkInExclusiveBoundsLargeWidth)
+    {
+        const auto v = Viewport::FromInclusive({ 0, 0, INT_MAX - 1, 0 });
+        auto pos = v.BottomRightInclusive();
+
+        VERIFY_IS_TRUE(v.WalkInExclusiveBounds(pos, 1));
+        VERIFY_ARE_EQUAL((til::point{ INT_MAX, 0 }), pos);
+    }
+
     TEST_METHOD(Offset)
     {
         til::inclusive_rect edges;

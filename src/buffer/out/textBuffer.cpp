@@ -110,18 +110,16 @@ void TextBuffer::_reserve(til::size screenBufferSize, const TextAttribute& defau
     _bufferOffsetCharOffsets = rowSize + charsBufferSize;
 
     // Use independently allocated blocks so unlimited scrollback can grow by
-    // appending storage. A roughly 1MiB target keeps the number of virtual
-    // allocations low without reserving a giant address range up front. The
-    // row count is rounded down to a power of two so hot row lookup uses a
-    // shift and mask instead of division.
-    // Small growable blocks keep the initial reservation bounded for unusually
-    // wide terminals. Finite buffers retain a 128-row floor to avoid creating
-    // an excessive number of virtual-memory areas at their largest dimensions.
-    const auto minimumRowsPerBlock = _growable ? size_t{ 1 } : _commitReadAheadRowCount;
-    const auto desiredRowsPerBlock = std::clamp(_targetBlockSize / rowStride, minimumRowsPerBlock, size_t{ 4096 });
+    // appending storage without reserving a giant address range up front. A
+    // roughly 1MiB target keeps the number of virtual allocations low. Finite
+    // buffers retain a single reservation and direct row-address fast path.
+    const auto totalRows = gsl::narrow<size_t>(static_cast<uint64_t>(h) + 1);
+    const auto desiredRowsPerBlock = _growable ?
+                                         std::clamp(_targetBlockSize / rowStride, size_t{ 1 }, size_t{ 4096 }) :
+                                         totalRows;
     _rowsPerBlock = 1;
     _rowBlockShift = 0;
-    while (_rowsPerBlock <= desiredRowsPerBlock / 2)
+    while (_growable ? _rowsPerBlock <= desiredRowsPerBlock / 2 : _rowsPerBlock < desiredRowsPerBlock)
     {
         _rowsPerBlock *= 2;
         ++_rowBlockShift;
@@ -129,7 +127,11 @@ void TextBuffer::_reserve(til::size screenBufferSize, const TextAttribute& defau
 
     _width = w;
     _height = h;
-    _reserveRows(gsl::narrow<size_t>(static_cast<uint64_t>(h) + 1));
+    _reserveRows(totalRows);
+    if (!_growable)
+    {
+        _finiteRowStorage = _rowBlocks.front().allocation.get();
+    }
 }
 
 // Adds enough independently reserved blocks for rowCount rows. rowCount
@@ -194,7 +196,7 @@ __declspec(noinline) void TextBuffer::_commit(const size_t rowIndex)
     _committedRowCount = idealEnd;
 }
 
-// Destructs rows after rowsToKeep and decommits complete unused blocks.
+// Destructs rows after rowsToKeep and decommits unused pages.
 // You can use this (or rather the Reset() method) to fully clear the TextBuffer.
 void TextBuffer::_decommit(til::CoordType rowsToKeep) noexcept
 {
@@ -204,15 +206,28 @@ void TextBuffer::_decommit(til::CoordType rowsToKeep) noexcept
 
     _destroy(firstRowToDestroy);
 
-    // Only decommit whole blocks here. The tail of the partially retained
-    // block stays committed and can safely be recommitted when reused.
+    SYSTEM_INFO systemInfo{};
+    GetSystemInfo(&systemInfo);
+    const auto pageMask = gsl::narrow_cast<size_t>(systemInfo.dwPageSize) - 1;
+
     for (size_t blockIndex = 0; blockIndex < _rowBlocks.size(); ++blockIndex)
     {
         const auto blockBegin = blockIndex << _rowBlockShift;
-        if (blockBegin >= storageRowsToKeep)
+        const auto& block = _rowBlocks[blockIndex];
+        const auto committedRowsInBlock = _committedRowCount > blockBegin ?
+                                              std::min(block.rowCount, _committedRowCount - blockBegin) :
+                                              size_t{ 0 };
+        const auto retainedRowsInBlock = storageRowsToKeep > blockBegin ?
+                                             std::min(committedRowsInBlock, storageRowsToKeep - blockBegin) :
+                                             size_t{ 0 };
+        const auto committedBytes = committedRowsInBlock * _bufferRowStride;
+        const auto retainedBytes = retainedRowsInBlock * _bufferRowStride;
+        const auto decommitOffset = retainedBytes == 0 ? size_t{ 0 } : (retainedBytes + pageMask) & ~pageMask;
+
+        if (decommitOffset < committedBytes)
         {
 #pragma warning(suppress : 6250) // Intentionally retain the MEM_RESERVE address range.
-            VirtualFree(_rowBlocks[blockIndex].allocation.get(), _rowBlocks[blockIndex].rowCount * _bufferRowStride, MEM_DECOMMIT);
+            VirtualFree(block.allocation.get() + decommitOffset, committedBytes - decommitOffset, MEM_DECOMMIT);
         }
     }
 
@@ -243,6 +258,14 @@ void TextBuffer::_destroy(const size_t begin) const noexcept
 
 std::byte* TextBuffer::_rowStorage(const size_t offset) const noexcept
 {
+    if (!_growable) [[likely]]
+    {
+        assert(_rowBlocks.size() == 1);
+        assert(offset < _rowBlocks.front().rowCount);
+        assert(_finiteRowStorage != nullptr);
+        return _finiteRowStorage + offset * _bufferRowStride;
+    }
+
     const auto blockIndex = offset >> _rowBlockShift;
     const auto offsetInBlock = offset & (_rowsPerBlock - 1);
     assert(blockIndex < _rowBlocks.size());
@@ -322,6 +345,12 @@ ROW& TextBuffer::GetMutableRowByOffset(const til::CoordType index)
     return _getRow(index);
 }
 
+void TextBuffer::ResetRow(const til::CoordType index, const TextAttribute& attributes)
+{
+    GetMutableRowByOffset(index).Reset(attributes);
+    _UpdateMarkRow(index, false);
+}
+
 // Returns a row filled with whitespace and the current attributes, for you to freely use.
 ROW& TextBuffer::GetScratchpadRow()
 {
@@ -366,24 +395,16 @@ til::CoordType TextBuffer::TotalRowCount() const noexcept
 }
 
 // Method Description:
-// - Gets the number of glyphs in the buffer between two points.
-// - IMPORTANT: Make sure that start is before end, or this will never return!
+// - Gets the number of cells in the buffer between two points.
+// - IMPORTANT: Make sure that start is before end.
 // Arguments:
 // - start - The starting point of the range to get the glyph count for.
 // - end - The ending point of the range to get the glyph count for.
 // Return Value:
-// - The number of glyphs in the buffer between the two points.
+// - The number of cells in the buffer between the two points.
 size_t TextBuffer::GetCellDistance(const til::point from, const til::point to) const
 {
-    auto startCell = GetCellDataAt(from);
-    const auto endCell = GetCellDataAt(to);
-    size_t delta = 0;
-    while (startCell != endCell)
-    {
-        ++startCell;
-        ++delta;
-    }
-    return delta;
+    return gsl::narrow<size_t>(GetSize().GetCellDistance(from, to));
 }
 
 // Routine Description:
@@ -808,7 +829,14 @@ void TextBuffer::IncrementCircularBuffer(const TextAttribute& fillAttributes)
     _PruneHyperlinks();
 
     // Second, clean out the old "first row" as it will become the "last row" of the buffer after the circle is performed.
-    GetMutableRowByOffset(0).Reset(fillAttributes);
+    ResetRow(0, fillAttributes);
+    if (_growable)
+    {
+        for (auto& row : _scrollMarkRows)
+        {
+            --row;
+        }
+    }
     {
         // Now proceed to increment.
         // Incrementing it will cause the next line down to become the new "top" of the window (the new "0" in logical coordinates)
@@ -954,7 +982,13 @@ void TextBuffer::CopyRow(const til::CoordType srcRowIndex, const til::CoordType 
 {
     auto& dstRow = dstBuffer.GetMutableRowByOffset(dstRowIndex);
     const auto& srcRow = GetRowByOffset(srcRowIndex);
+    const auto scrollbarData = srcRow.GetScrollbarData();
     dstRow.CopyFrom(srcRow);
+    if (dstBuffer._growable)
+    {
+        dstBuffer._UpdateMarkRow(dstRowIndex, scrollbarData.has_value());
+    }
+    dstRow.SetScrollbarData(scrollbarData);
     ImageSlice::CopyRow(srcRow, dstRow);
 }
 
@@ -1067,6 +1101,8 @@ til::point TextBuffer::BufferToScreenPosition(const til::point position) const
 void TextBuffer::Reset() noexcept
 {
     _decommit(0);
+    _ResetHyperlinks();
+    _scrollMarkRows.clear();
     if (_growable)
     {
         _firstRow = 0;
@@ -1087,11 +1123,7 @@ void TextBuffer::ClearScrollback(const til::CoordType newFirstRow, const til::Co
     // The new viewport should keep 0 rows? Then just reset everything.
     if (rowsToKeep <= 0)
     {
-        _decommit(0);
-        if (_growable)
-        {
-            _firstRow = 0;
-        }
+        Reset();
         return;
     }
 
@@ -1107,40 +1139,6 @@ void TextBuffer::ClearScrollback(const til::CoordType newFirstRow, const til::Co
     _firstRow = 0;
     ScrollRows(startAbsolute, rowsToKeep, -startAbsolute);
 
-    // Unlimited buffers never rotate, so their hyperlink table grows with
-    // their history. Retain only IDs that survived the clear (plus a hyperlink
-    // that is currently open and may be used by subsequent output).
-    if (!_hyperlinkMap.empty())
-    {
-        std::unordered_set<uint16_t> retainedHyperlinks;
-        if (const auto activeHyperlink = _currentAttributes.GetHyperlinkId())
-        {
-            retainedHyperlinks.emplace(activeHyperlink);
-        }
-        for (til::CoordType y = 0; y < rowsToKeep; ++y)
-        {
-            for (const auto id : GetRowByOffset(y).GetHyperlinks())
-            {
-                retainedHyperlinks.emplace(id);
-            }
-        }
-
-        std::vector<uint16_t> discardedHyperlinks;
-        discardedHyperlinks.reserve(_hyperlinkMap.size());
-        for (const auto& hyperlink : _hyperlinkMap)
-        {
-            const auto id = hyperlink.first;
-            if (!retainedHyperlinks.contains(id))
-            {
-                discardedHyperlinks.emplace_back(id);
-            }
-        }
-        for (const auto id : discardedHyperlinks)
-        {
-            RemoveHyperlinkFromMap(id);
-        }
-    }
-
     _decommit(rowsToKeep);
 
     // Unlimited buffers grow by appending independently reserved blocks. Once
@@ -1152,7 +1150,14 @@ void TextBuffer::ClearScrollback(const til::CoordType newFirstRow, const til::Co
         const auto storageRowCount = gsl::narrow_cast<size_t>(_height) + 1;
         const auto blockCount = (storageRowCount + _rowsPerBlock - 1) >> _rowBlockShift;
         _rowBlocks.resize(blockCount);
+        const auto firstDiscardedMark = std::lower_bound(_scrollMarkRows.begin(), _scrollMarkRows.end(), rowsToKeep);
+        _scrollMarkRows.erase(firstDiscardedMark, _scrollMarkRows.end());
     }
+
+    // Unlimited buffers never rotate, so their hyperlink table grows with
+    // their history. Retain only IDs that survived the clear (plus a hyperlink
+    // that is currently open and may be used by subsequent output).
+    _PruneUnusedHyperlinks();
 }
 
 // Routine Description:
@@ -1199,6 +1204,8 @@ void TextBuffer::ResizeTraditional(til::size newSize)
     _rowBlockShift = newBuffer._rowBlockShift;
     _width = newBuffer._width;
     _height = newBuffer._height;
+    _scrollMarkRows = std::move(newBuffer._scrollMarkRows);
+    _finiteRowStorage = newBuffer._finiteRowStorage;
 
     _SetFirstRowIndex(0);
 }
@@ -1618,6 +1625,104 @@ void TextBuffer::_PruneHyperlinks()
             RemoveHyperlinkFromMap(hyperlinkReference);
         }
     }
+}
+
+// Remove hyperlink mappings that are not referenced by any committed row.
+// The currently active hyperlink is retained because subsequent output may
+// still use it even if no cell has referenced it yet.
+void TextBuffer::_PruneUnusedHyperlinks()
+{
+    if (_hyperlinkMap.empty())
+    {
+        _hyperlinkCustomIdMap.clear();
+        return;
+    }
+
+    std::unordered_set<uint16_t> retainedHyperlinks;
+    retainedHyperlinks.reserve(_hyperlinkMap.size());
+
+    const auto retain = [&](const uint16_t id) {
+        if (id != 0 && _hyperlinkMap.contains(id))
+        {
+            retainedHyperlinks.emplace(id);
+        }
+    };
+
+    retain(_currentAttributes.GetHyperlinkId());
+    retain(_initialAttributes.GetHyperlinkId());
+
+    // Rows are committed from the beginning of the underlying storage. Walk
+    // them directly so this sweep neither commits unused rows nor scans a large
+    // logical height left behind by a reset growable buffer.
+    for (size_t offset = 1; offset < _committedRowCount && retainedHyperlinks.size() < _hyperlinkMap.size(); ++offset)
+    {
+#pragma warning(suppress : 26490) // The virtual-memory row storage contains constructed ROW objects.
+        const auto& row = *reinterpret_cast<const ROW*>(_rowStorage(offset));
+        for (const auto& run : row.Attributes().runs())
+        {
+            retain(run.value.GetHyperlinkId());
+        }
+    }
+
+    for (auto it = _hyperlinkMap.begin(); it != _hyperlinkMap.end();)
+    {
+        if (!retainedHyperlinks.contains(it->first))
+        {
+            it = _hyperlinkMap.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    // Prune this map in one pass. Calling RemoveHyperlinkFromMap for every
+    // discarded ID would repeatedly rescan it and turn a bulk clear into O(M^2).
+    for (auto it = _hyperlinkCustomIdMap.begin(); it != _hyperlinkCustomIdMap.end();)
+    {
+        if (!_hyperlinkMap.contains(it->second))
+        {
+            it = _hyperlinkCustomIdMap.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
+// Reset cannot allocate because it is noexcept. Erase everything except an
+// active hyperlink, which must remain resolvable if later output uses it.
+void TextBuffer::_ResetHyperlinks() noexcept
+{
+    const auto activeHyperlink = _currentAttributes.GetHyperlinkId();
+    const auto retainActiveHyperlink = activeHyperlink != 0 && _hyperlinkMap.contains(activeHyperlink);
+
+    for (auto it = _hyperlinkMap.begin(); it != _hyperlinkMap.end();)
+    {
+        if (!retainActiveHyperlink || it->first != activeHyperlink)
+        {
+            it = _hyperlinkMap.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    for (auto it = _hyperlinkCustomIdMap.begin(); it != _hyperlinkCustomIdMap.end();)
+    {
+        if (!retainActiveHyperlink || it->second != activeHyperlink)
+        {
+            it = _hyperlinkCustomIdMap.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    _currentHyperlinkId = 1;
 }
 
 // Method Description:
@@ -2932,15 +3037,16 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
                 break;
             }
 
-            auto& newRow = newBuffer.GetMutableRowByOffset(newY);
-
             // See the comment marked with "REFLOW_RESET".
             if (newY >= newHeight)
             {
-                newRow.Reset(newBuffer._initialAttributes);
+                newBuffer.ResetRow(newY, newBuffer._initialAttributes);
             }
 
+            auto& newRow = newBuffer.GetMutableRowByOffset(newY);
             newRow.CopyFrom(oldRow);
+            newBuffer._UpdateMarkRow(newY, oldRow.GetScrollbarData().has_value());
+            newRow.SetScrollbarData(oldRow.GetScrollbarData());
             newRow.SetWrapForced(false);
 
             if (oldY == oldCursorPos.y)
@@ -2988,7 +3094,7 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
             {
                 break;
             }
-            newBuffer.GetMutableRowByOffset(newY).SetScrollbarData(oldRow.GetScrollbarData());
+            newBuffer.SetScrollbarData(*oldRow.GetScrollbarData(), newY);
         }
 
         til::CoordType oldX = 0;
@@ -3025,7 +3131,7 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
                 {
                     break;
                 }
-                newBuffer.GetMutableRowByOffset(newY).Reset(newBuffer._initialAttributes);
+                newBuffer.ResetRow(newY, newBuffer._initialAttributes);
             }
 
             auto& newRow = newBuffer.GetMutableRowByOffset(newY);
@@ -3178,9 +3284,16 @@ uint16_t TextBuffer::GetHyperlinkId(std::wstring_view uri, std::wstring_view id)
         }
     }
 
-    // Hyperlink IDs are packed into 16 bits of TextAttribute. Once the counter
-    // wraps, find an ID that is no longer referenced instead of overwriting a
-    // live mapping and making old scrollback point at the wrong URI.
+    // Hyperlink IDs are packed into 16 bits of TextAttribute. OSC 8 sequences
+    // add their mapping before any output references it, so reclaim unreachable
+    // mappings before declaring the ID space exhausted.
+    if (_hyperlinkMap.size() >= UINT16_MAX)
+    {
+        _PruneUnusedHyperlinks();
+    }
+
+    // Once the counter wraps, find an unused ID instead of overwriting a live
+    // mapping and making old scrollback point at the wrong URI.
     uint16_t numericId = 0;
     for (size_t attempts = 0; attempts < UINT16_MAX && _hyperlinkMap.size() < UINT16_MAX; ++attempts)
     {
@@ -3316,6 +3429,26 @@ std::optional<std::vector<til::point_span>> TextBuffer::SearchText(const std::ws
 std::vector<ScrollMark> TextBuffer::GetMarkRows() const
 {
     std::vector<ScrollMark> marks;
+    if (_growable)
+    {
+        marks.reserve(_scrollMarkRows.size());
+        for (const auto y : _scrollMarkRows)
+        {
+            if (y >= _height)
+            {
+                break;
+            }
+            if (_isRowCommitted(y))
+            {
+                if (const auto& data = GetRowByOffset(y).GetScrollbarData())
+                {
+                    marks.emplace_back(y, *data);
+                }
+            }
+        }
+        return marks;
+    }
+
     const auto bottom = _estimateOffsetOfLastCommittedRow();
     for (auto y = 0; y <= bottom; y++)
     {
@@ -3347,14 +3480,13 @@ std::vector<MarkExtents> TextBuffer::GetMarkExtents(size_t limit) const
     std::vector<MarkExtents> marks{};
     const auto bottom = _estimateOffsetOfLastCommittedRow();
     auto lastPromptY = bottom;
-    for (auto promptY = bottom; promptY >= 0; promptY--)
-    {
+    const auto collectMark = [&](const til::CoordType promptY) {
         const auto& currRow = GetRowByOffset(promptY);
         auto& rowPromptData = currRow.GetScrollbarData();
         if (!rowPromptData.has_value())
         {
             // This row didn't start a prompt, don't even look here.
-            continue;
+            return false;
         }
 
         // Future thought! In #11000 & #14792, we considered the possibility of
@@ -3367,7 +3499,7 @@ std::vector<MarkExtents> TextBuffer::GetMarkExtents(size_t limit) const
 
         if (rowPromptData->category == MarkCategory::Default)
         {
-            continue;
+            return false;
         }
 
         // This row did start a prompt! Find the prompt that starts here.
@@ -3379,10 +3511,33 @@ std::vector<MarkExtents> TextBuffer::GetMarkExtents(size_t limit) const
         // nullopt, unfortunately.
         if (marks.size() >= limit)
         {
-            break;
+            return true;
         }
 
         lastPromptY = promptY;
+        return false;
+    };
+
+    if (_growable)
+    {
+        auto it = std::upper_bound(_scrollMarkRows.begin(), _scrollMarkRows.end(), bottom);
+        while (it != _scrollMarkRows.begin())
+        {
+            if (collectMark(*--it))
+            {
+                break;
+            }
+        }
+    }
+    else
+    {
+        for (auto promptY = bottom; promptY >= 0; promptY--)
+        {
+            if (collectMark(promptY))
+            {
+                break;
+            }
+        }
     }
 
     std::reverse(marks.begin(), marks.end());
@@ -3406,6 +3561,13 @@ void TextBuffer::ClearMarksInRange(
         {
             attr.SetMarkAttributes(MarkKind::None);
         }
+    }
+
+    if (_growable && top <= bottom)
+    {
+        const auto first = std::lower_bound(_scrollMarkRows.begin(), _scrollMarkRows.end(), top);
+        const auto last = std::upper_bound(first, _scrollMarkRows.end(), bottom);
+        _scrollMarkRows.erase(first, last);
     }
 }
 void TextBuffer::ClearAllMarks()
@@ -3575,6 +3737,20 @@ std::wstring TextBuffer::_commandForRow(const til::CoordType rowOffset,
 std::wstring TextBuffer::CurrentCommand() const
 {
     auto promptY = GetCursor().GetPosition().y;
+    if (_growable)
+    {
+        auto it = std::upper_bound(_scrollMarkRows.begin(), _scrollMarkRows.end(), promptY);
+        while (it != _scrollMarkRows.begin())
+        {
+            promptY = *--it;
+            if (GetRowByOffset(promptY).GetScrollbarData().has_value())
+            {
+                return _commandForRow(promptY, _estimateOffsetOfLastCommittedRow(), true);
+            }
+        }
+        return L"";
+    }
+
     for (; promptY >= 0; promptY--)
     {
         const auto& currRow = GetRowByOffset(promptY);
@@ -3598,14 +3774,13 @@ std::vector<std::wstring> TextBuffer::Commands() const
     std::vector<std::wstring> commands{};
     const auto bottom = _estimateOffsetOfLastCommittedRow();
     auto lastPromptY = bottom;
-    for (auto promptY = bottom; promptY >= 0; promptY--)
-    {
+    const auto collectCommand = [&](const til::CoordType promptY) {
         const auto& currRow = GetRowByOffset(promptY);
         auto& rowPromptData = currRow.GetScrollbarData();
         if (!rowPromptData.has_value())
         {
             // This row didn't start a prompt, don't even look here.
-            continue;
+            return;
         }
 
         // This row did start a prompt! Find the prompt that starts here.
@@ -3617,6 +3792,22 @@ std::vector<std::wstring> TextBuffer::Commands() const
             commands.emplace_back(std::move(foundCommand));
         }
         lastPromptY = promptY;
+    };
+
+    if (_growable)
+    {
+        auto it = std::upper_bound(_scrollMarkRows.begin(), _scrollMarkRows.end(), bottom);
+        while (it != _scrollMarkRows.begin())
+        {
+            collectCommand(*--it);
+        }
+    }
+    else
+    {
+        for (auto promptY = bottom; promptY >= 0; promptY--)
+        {
+            collectCommand(promptY);
+        }
     }
     std::reverse(commands.begin(), commands.end());
     return commands;
@@ -3626,6 +3817,7 @@ void TextBuffer::StartPrompt()
 {
     const auto currentRowOffset = GetCursor().GetPosition().y;
     auto& currentRow = GetMutableRowByOffset(currentRowOffset);
+    _UpdateMarkRow(currentRowOffset, true);
     currentRow.StartPrompt();
 
     _currentAttributes.SetMarkAttributes(MarkKind::Prompt);
@@ -3672,6 +3864,7 @@ bool TextBuffer::_createPromptMarkIfNeeded()
     //   to be Prompt, and set the current attrs to Output.
 
     auto& row = GetMutableRowByOffset(GetCursor().GetPosition().y);
+    _UpdateMarkRow(GetCursor().GetPosition().y, true);
     row.StartPrompt();
     return true;
 }
@@ -3695,14 +3888,37 @@ void TextBuffer::EndCurrentCommand(std::optional<unsigned int> error)
 {
     _currentAttributes.SetMarkAttributes(MarkKind::None);
 
-    for (auto y = GetCursor().GetPosition().y; y >= 0; y--)
-    {
+    const auto endCommand = [&](const til::CoordType y) {
         auto& currRow = GetMutableRowByOffset(y);
         auto& rowPromptData = currRow.GetScrollbarData();
         if (rowPromptData.has_value())
         {
             currRow.EndOutput(error);
-            return;
+            return true;
+        }
+        return false;
+    };
+
+    if (_growable)
+    {
+        const auto cursorY = GetCursor().GetPosition().y;
+        auto it = std::upper_bound(_scrollMarkRows.begin(), _scrollMarkRows.end(), cursorY);
+        while (it != _scrollMarkRows.begin())
+        {
+            if (endCommand(*--it))
+            {
+                return;
+            }
+        }
+    }
+    else
+    {
+        for (auto y = GetCursor().GetPosition().y; y >= 0; y--)
+        {
+            if (endCommand(y))
+            {
+                return;
+            }
         }
     }
 }
@@ -3710,7 +3926,27 @@ void TextBuffer::EndCurrentCommand(std::optional<unsigned int> error)
 void TextBuffer::SetScrollbarData(ScrollbarData mark, til::CoordType y)
 {
     auto& row = GetMutableRowByOffset(y);
+    _UpdateMarkRow(y, true);
     row.SetScrollbarData(mark);
+}
+
+void TextBuffer::_UpdateMarkRow(const til::CoordType row, const bool hasMark)
+{
+    if (!_growable)
+    {
+        return;
+    }
+
+    const auto it = std::lower_bound(_scrollMarkRows.begin(), _scrollMarkRows.end(), row);
+    const auto found = it != _scrollMarkRows.end() && *it == row;
+    if (hasMark && !found)
+    {
+        _scrollMarkRows.insert(it, row);
+    }
+    else if (!hasMark && found)
+    {
+        _scrollMarkRows.erase(it);
+    }
 }
 void TextBuffer::ManuallyMarkRowAsPrompt(til::CoordType y)
 {

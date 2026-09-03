@@ -2478,7 +2478,7 @@ bool AdaptDispatch::_DoLineFeed(const Page& page, const bool withReturn, const b
         else
         {
             const auto eraseAttributes = _GetEraseAttributes(page);
-            textBuffer.GetMutableRowByOffset(newPosition.y).Reset(eraseAttributes);
+            textBuffer.ResetRow(newPosition.y, eraseAttributes);
         }
     }
     else
@@ -3176,12 +3176,18 @@ void AdaptDispatch::_EraseScrollback()
     const auto page = _pages.VisiblePage();
     auto& cursor = page.Cursor();
     const auto row = cursor.GetPosition().y;
+    const auto rowsRemoved = page.Top();
 
-    page.Buffer().ClearScrollback(page.Top(), page.Height());
+    page.Buffer().ClearScrollback(rowsRemoved, page.Height());
     // Move the viewport
     _api.SetViewportPosition({ page.XPanOffset(), 0 });
     // Move the cursor to the same relative location.
-    cursor.SetYPosition(row - page.Top());
+    cursor.SetYPosition(row - rowsRemoved);
+
+    if (rowsRemoved > 0)
+    {
+        _api.NotifyBufferCompaction(rowsRemoved);
+    }
 }
 
 //Routine Description:

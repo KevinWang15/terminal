@@ -216,6 +216,11 @@ public:
         Log::Comment(L"NotifyBufferRotation MOCK called...");
     }
 
+    void NotifyBufferCompaction(const int /*delta*/) override
+    {
+        Log::Comment(L"NotifyBufferCompaction MOCK called...");
+    }
+
     void NotifyShellIntegrationMark() override
     {
         Log::Comment(L"NotifyShellIntegrationMark MOCK called...");

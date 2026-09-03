@@ -90,6 +90,7 @@ public:
     ROW& GetScratchpadRow(const TextAttribute& attributes);
     const ROW& GetRowByOffset(til::CoordType index) const;
     ROW& GetMutableRowByOffset(til::CoordType index);
+    void ResetRow(til::CoordType index, const TextAttribute& attributes);
 
     TextBufferCellIterator GetCellDataAt(const til::point at) const;
     TextBufferCellIterator GetCellLineDataAt(const til::point at) const;
@@ -340,6 +341,9 @@ private:
     til::point _GetDelimiterClassRunStart(til::point pos, const std::wstring_view wordDelimiters, const bool accessibilityMode = false) const;
     til::point _GetDelimiterClassRunEnd(til::point pos, const std::wstring_view wordDelimiters, const bool accessibilityMode = false) const;
     void _PruneHyperlinks();
+    void _PruneUnusedHyperlinks();
+    void _ResetHyperlinks() noexcept;
+    void _UpdateMarkRow(til::CoordType row, bool hasMark);
 
     std::wstring _commandForRow(const til::CoordType rowOffset, const til::CoordType bottomInclusive, const bool clipAtCursor = false) const;
     MarkExtents _scrollMarkExtentForRow(const til::CoordType rowOffset, const til::CoordType bottomInclusive) const;
@@ -357,9 +361,14 @@ private:
     std::unordered_map<std::wstring, uint16_t> _hyperlinkCustomIdMap;
     uint16_t _currentHyperlinkId = 1;
 
+    // Growable buffers can contain far more rows than marks. Keep their marked
+    // row offsets separately so the scrollbar hot path scales with the number
+    // of marks instead of the size of the scrollback history.
+    std::vector<til::CoordType> _scrollMarkRows;
+
     // These blocks describe the state of the underlying virtual memory storage
-    // that holds all ROWs, text and attributes. Storage is segmented so a
-    // growable buffer can append blocks without relocating existing history.
+    // that holds all ROWs, text and attributes. Finite buffers use one block;
+    // growable buffers append blocks without relocating existing history.
     // Blocks are initially allocated with MEM_RESERVE to reduce the private
     // working set of conhost and Terminal.
     // ROWs are laid out like this in memory:
@@ -390,6 +399,9 @@ private:
     };
 
     std::vector<RowBlock> _rowBlocks;
+    // Non-owning cache for the common finite-buffer row lookup path. The
+    // allocation itself remains owned by the sole element in _rowBlocks.
+    std::byte* _finiteRowStorage = nullptr;
 
     // Rows in [0, _committedRowCount) have been committed via MEM_COMMIT and
     // contain ready-to-use ROW objects. Row 0 is the scratchpad; regular rows

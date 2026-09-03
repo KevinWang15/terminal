@@ -625,7 +625,7 @@ namespace winrt::Microsoft::Terminal::Settings::Editor::implementation
     int32_t ProfileViewModel::FiniteHistorySize() const
     {
         const auto historySize{ HistorySize() };
-        return historySize == -1 ? _lastFiniteHistorySize : std::max(historySize, 0);
+        return historySize == UNLIMITED_HISTORY_SIZE ? _lastFiniteHistorySize : std::max(historySize, 0);
     }
 
     void ProfileViewModel::FiniteHistorySize(const int32_t value)
@@ -654,7 +654,7 @@ namespace winrt::Microsoft::Terminal::Settings::Editor::implementation
 
     bool ProfileViewModel::UnlimitedScrollback() const
     {
-        return HistorySize() == -1;
+        return HistorySize() == UNLIMITED_HISTORY_SIZE;
     }
 
     void ProfileViewModel::UnlimitedScrollback(const bool unlimited)
@@ -670,7 +670,7 @@ namespace winrt::Microsoft::Terminal::Settings::Editor::implementation
             {
                 _lastFiniteHistorySize = historySize;
             }
-            HistorySize(-1);
+            HistorySize(UNLIMITED_HISTORY_SIZE);
         }
         else
         {

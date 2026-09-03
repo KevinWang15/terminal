@@ -234,6 +234,27 @@ bool Viewport::DecrementInBounds(til::point& pos, bool allowEndExclusive) const 
     return WalkInBounds(pos, -1, allowEndExclusive);
 }
 
+// Method Description:
+// - Gets the signed cell distance from one coordinate to another while walking
+//   left to right, top to bottom through this viewport.
+// Arguments:
+// - from - The coordinate to measure from.
+// - to - The coordinate to measure to.
+// - allowEndExclusive - if true, allow the EndExclusive til::point as a valid position.
+// Return Value:
+// - The exact number of cells from `from` to `to`. The result is negative when
+//   `to` precedes `from`.
+#pragma warning(suppress : 4100)
+til::HugeCoordType Viewport::GetCellDistance(const til::point from, const til::point to, bool allowEndExclusive) const noexcept
+{
+    assert(IsInBounds(from, allowEndExclusive));
+    assert(IsInBounds(to, allowEndExclusive));
+
+    const auto width = static_cast<til::HugeCoordType>(_sr.right) - _sr.left + 1;
+    return (static_cast<til::HugeCoordType>(to.y) - from.y) * width +
+           (static_cast<til::HugeCoordType>(to.x) - from.x);
+}
+
 // Routine Description:
 // - Compares two coordinate positions to determine whether they're the same, left, or right within the given buffer size
 // Arguments:
@@ -248,31 +269,13 @@ bool Viewport::DecrementInBounds(til::point& pos, bool allowEndExclusive) const 
 // -  Positive if First is to the right of the Second.
 // -  This is so you can do s_CompareCoords(first, second) <= 0 for "first is left or the same as second".
 //    (the < looks like a left arrow :D)
-// -  The magnitude of the result is the distance between the two coordinates when typing characters into the buffer (left to right, top to bottom)
+// -  The magnitude is the distance between the two coordinates, clamped to the
+//    range of an int. Use GetCellDistance when the exact magnitude is needed.
 #pragma warning(suppress : 4100)
 int Viewport::CompareInBounds(const til::point first, const til::point second, bool allowEndExclusive) const noexcept
 {
-    // Assert that our coordinates are within the expected boundaries
-    assert(IsInBounds(first, allowEndExclusive));
-    assert(IsInBounds(second, allowEndExclusive));
-
-    // First set the distance vertically
-    //   If first is on row 4 and second is on row 6, first will be -2 rows behind second * an 80 character row would be -160.
-    //   For the same row, it'll be 0 rows * 80 character width = 0 difference.
-    auto retVal = (gsl::narrow_cast<til::HugeCoordType>(first.y) - second.y) * Width();
-
-    // Now adjust for horizontal differences
-    //   If first is in position 15 and second is in position 30, first is -15 left in relation to 30.
-    retVal += gsl::narrow_cast<til::HugeCoordType>(first.x) - second.x;
-
-    // Further notes:
-    //   If we already moved behind one row, this will help correct for when first is right of second.
-    //     For example, with row 4, col 79 and row 5, col 0 as first and second respectively, the distance is -1.
-    //     Assume the row width is 80.
-    //     Step one will set the retVal as -80 as first is one row behind the second.
-    //     Step two will then see that first is 79 - 0 = +79 right of second and add 79
-    //     The total is -80 + 79 = -1.
-    return gsl::narrow_cast<int>(std::clamp<til::HugeCoordType>(retVal, INT_MIN, INT_MAX));
+    const auto distance = GetCellDistance(second, first, allowEndExclusive);
+    return gsl::narrow_cast<int>(std::clamp<til::HugeCoordType>(distance, INT_MIN, INT_MAX));
 }
 
 // Method Description:
@@ -290,8 +293,8 @@ bool Viewport::WalkInBounds(til::point& pos, const til::CoordType delta, bool al
 {
     const auto l = static_cast<til::HugeCoordType>(_sr.left);
     const auto t = static_cast<til::HugeCoordType>(_sr.top);
-    const auto w = static_cast<til::HugeCoordType>(std::max(0, _sr.right - _sr.left + 1));
-    const auto h = static_cast<til::HugeCoordType>(std::max(0, _sr.bottom - _sr.top + 1));
+    const auto w = std::max<til::HugeCoordType>(0, static_cast<til::HugeCoordType>(_sr.right) - _sr.left + 1);
+    const auto h = std::max<til::HugeCoordType>(0, static_cast<til::HugeCoordType>(_sr.bottom) - _sr.top + 1);
     const auto max = w * h - !allowEndExclusive;
     const auto off = w * (pos.y - t) + (pos.x - l) + delta;
     const auto offClamped = std::clamp(off, til::HugeCoordType{ 0 }, max);
@@ -345,8 +348,8 @@ bool Viewport::WalkInExclusiveBounds(til::point& pos, const til::CoordType delta
 {
     const auto l = static_cast<til::HugeCoordType>(_sr.left);
     const auto t = static_cast<til::HugeCoordType>(_sr.top);
-    const auto w = static_cast<til::HugeCoordType>(std::max(0, _sr.right - _sr.left + 2));
-    const auto h = static_cast<til::HugeCoordType>(std::max(0, _sr.bottom - _sr.top + 1));
+    const auto w = std::max<til::HugeCoordType>(0, static_cast<til::HugeCoordType>(_sr.right) - _sr.left + 2);
+    const auto h = std::max<til::HugeCoordType>(0, static_cast<til::HugeCoordType>(_sr.bottom) - _sr.top + 1);
     const auto max = w * h;
     const auto off = w * (pos.y - t) + (pos.x - l) + delta;
     const auto offClamped = std::clamp(off, til::HugeCoordType{ 0 }, max);

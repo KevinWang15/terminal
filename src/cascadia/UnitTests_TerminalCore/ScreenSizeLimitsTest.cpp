@@ -30,6 +30,9 @@ namespace TerminalCoreUnitTests
         TEST_METHOD(InfiniteHistoryDoesNotGrowAlternateBuffer);
         TEST_METHOD(InfiniteHistoryPreservesScrolledViewport);
         TEST_METHOD(InfiniteHistoryClearShrinksAndRegrows);
+        TEST_METHOD(InfiniteHistoryClearRebasesRetainedSelection);
+        TEST_METHOD(InfiniteHistoryClearClipsSelectionAtCutoff);
+        TEST_METHOD(InfiniteHistoryClearDropsDiscardedSelectionAndScrollOffset);
 
         TEST_METHOD(ResizeIsClampedToBounds);
         TEST_METHOD(InfiniteHistorySurvivesReflow);
@@ -179,6 +182,107 @@ void ScreenSizeLimitsTest::InfiniteHistoryClearShrinksAndRegrows()
 
     terminal.Write(L"8\r\n9\r\n10\r\n11\r\n12\r\n");
     VERIFY_IS_TRUE(terminal.GetTextBuffer().TotalRowCount() > 4);
+}
+
+void ScreenSizeLimitsTest::InfiniteHistoryClearRebasesRetainedSelection()
+{
+    auto settings = winrt::make<MockTermSettings>(-1, 4, 16);
+    Terminal terminal{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &terminal };
+    terminal.CreateFromSettings(settings, renderer);
+
+    terminal.Write(L"line0\r\nline1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\nline7\r\n");
+    const auto rowsRemoved = terminal.ViewStartIndex();
+    VERIFY_IS_TRUE(rowsRemoved > 0);
+
+    // Select text in the live viewport. ED3 retains this row, but moves it to
+    // the beginning of the compacted buffer.
+    terminal.SetSelectionAnchor({ 0, 0 });
+    terminal.SetSelectionEnd({ 5, 0 });
+    const auto selectedBefore = terminal.RetrieveSelectedTextFromBuffer(false).plainText;
+    VERIFY_ARE_EQUAL(std::wstring{ L"line5" }, selectedBefore);
+    VERIFY_ARE_EQUAL(rowsRemoved, terminal.GetSelectionAnchor().y);
+
+    terminal.Write(L"\x1b[3J");
+
+    VERIFY_IS_TRUE(terminal.IsSelectionActive());
+    VERIFY_ARE_EQUAL(0, terminal.GetSelectionAnchor().y);
+    VERIFY_ARE_EQUAL(0, terminal.GetSelectionEnd().y);
+    VERIFY_ARE_EQUAL(selectedBefore, terminal.RetrieveSelectedTextFromBuffer(false).plainText);
+    VERIFY_ARE_EQUAL(0, terminal.GetViewport().Top());
+
+    // Selection keeps the retained row visible while new output grows the
+    // buffer again.
+    terminal.Write(L"next\r\n");
+    VERIFY_IS_TRUE(terminal.ViewStartIndex() > 0);
+    VERIFY_ARE_EQUAL(0, terminal.GetViewport().Top());
+    VERIFY_ARE_EQUAL(selectedBefore, terminal.RetrieveSelectedTextFromBuffer(false).plainText);
+}
+
+void ScreenSizeLimitsTest::InfiniteHistoryClearClipsSelectionAtCutoff()
+{
+    auto settings = winrt::make<MockTermSettings>(-1, 4, 16);
+    Terminal terminal{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &terminal };
+    terminal.CreateFromSettings(settings, renderer);
+
+    terminal.Write(L"line0\r\nline1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\nline7\r\n");
+    const auto rowsRemoved = terminal.ViewStartIndex();
+    VERIFY_IS_TRUE(rowsRemoved > 0);
+
+    // Begin in the final discarded row and end in the first retained row.
+    terminal.UserScrollViewport(rowsRemoved - 1);
+    terminal.SetSelectionAnchor({ 2, 0 });
+    terminal.SetSelectionEnd({ 3, 1 });
+
+    terminal.Write(L"\x1b[3J");
+
+    VERIFY_IS_TRUE(terminal.IsSelectionActive());
+    VERIFY_ARE_EQUAL((til::point{}), terminal.GetSelectionAnchor());
+    VERIFY_ARE_EQUAL((til::point{ 3, 0 }), terminal.GetSelectionEnd());
+    VERIFY_ARE_EQUAL(std::wstring{ L"lin" }, terminal.RetrieveSelectedTextFromBuffer(false).plainText);
+}
+
+void ScreenSizeLimitsTest::InfiniteHistoryClearDropsDiscardedSelectionAndScrollOffset()
+{
+    auto settings = winrt::make<MockTermSettings>(-1, 4, 16);
+    Terminal terminal{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &terminal };
+    terminal.CreateFromSettings(settings, renderer);
+
+    terminal.Write(L"line0\r\nline1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\nline7\r\n");
+    const auto rowsRemoved = terminal.ViewStartIndex();
+    VERIFY_IS_TRUE(rowsRemoved > 0);
+
+    // Select a half-open range whose end is exactly the first retained cell.
+    // ED3 discards the entire range.
+    terminal.UserScrollViewport(rowsRemoved - 1);
+    terminal.SetSelectionAnchor({ 0, 0 });
+    terminal.SetSelectionEnd({ 0, 1 });
+    VERIFY_ARE_EQUAL((til::point{ 0, rowsRemoved }), terminal.GetSelectionEnd());
+    terminal.ToggleMarkMode();
+    VERIFY_IS_TRUE(Terminal::SelectionInteractionMode::Mark == terminal.SelectionMode());
+
+    terminal.Write(L"\x1b[3J");
+
+    VERIFY_IS_FALSE(terminal.IsSelectionActive());
+    VERIFY_IS_TRUE(Terminal::SelectionInteractionMode::None == terminal.SelectionMode());
+    VERIFY_IS_TRUE(terminal.RetrieveSelectedTextFromBuffer(false).plainText.empty());
+    VERIFY_ARE_EQUAL(0, terminal.GetViewport().Top());
+
+    // Entering mark mode again must create a fresh selection instead of
+    // interpreting the stale pre-compaction mode as a request to leave it.
+    terminal.ToggleMarkMode();
+    VERIFY_IS_TRUE(terminal.IsSelectionActive());
+    VERIFY_IS_TRUE(Terminal::SelectionInteractionMode::Mark == terminal.SelectionMode());
+    VERIFY_IS_TRUE(terminal.GetSelectionAnchor().y < terminal.GetTextBuffer().TotalRowCount());
+    terminal.ClearSelection();
+
+    // The old user scroll offset referred only to discarded history. Once the
+    // selection is gone, subsequent output should follow the mutable viewport.
+    terminal.Write(L"after\r\n");
+    VERIFY_IS_TRUE(terminal.ViewStartIndex() > 0);
+    VERIFY_ARE_EQUAL(terminal.ViewStartIndex(), terminal.GetViewport().Top());
 }
 
 void ScreenSizeLimitsTest::ResizeIsClampedToBounds()

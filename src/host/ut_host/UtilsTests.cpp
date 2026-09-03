@@ -155,4 +155,14 @@ class UtilsTests
         result = Utils::s_CompareCoords(coordMaxBuffer, coordA, coordB);
         VERIFY_IS_GREATER_THAN(result, 0);
     }
+
+    TEST_METHOD(TestCompareCoordsLargeCoordinates)
+    {
+        constexpr til::size bufferSize{ 3, 1'000'000'000 };
+        constexpr til::point begin{};
+        constexpr til::point end{ 0, bufferSize.height - 1 };
+
+        VERIFY_ARE_EQUAL(INT_MIN, Utils::s_CompareCoords(bufferSize, begin, end));
+        VERIFY_ARE_EQUAL(INT_MAX, Utils::s_CompareCoords(bufferSize, end, begin));
+    }
 };

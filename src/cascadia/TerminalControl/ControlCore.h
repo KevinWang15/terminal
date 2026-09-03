@@ -418,6 +418,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         til::point _contextMenuBufferPosition{ 0, 0 };
         Windows::Foundation::Collections::IVector<hstring> _cachedQuickFixes{ nullptr };
         ::Search _searcher;
+        std::optional<til::point_span> _staleSearchAnchor;
+        // Passive refreshes should never cost more than searching the largest
+        // traditional finite buffer. Searches explicitly requested by the user
+        // are always allowed to inspect the full retained history.
+        static constexpr til::CoordType _maximumRowsForPassiveSearch = 32'767;
         std::optional<interval_tree::IntervalTree<til::point, size_t>::interval> _lastHoveredInterval;
         std::optional<wchar_t> _leadingSurrogate;
         std::optional<til::point> _lastHoveredCell;

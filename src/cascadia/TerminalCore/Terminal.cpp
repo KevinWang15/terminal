@@ -43,7 +43,7 @@ Terminal::Terminal(TestDummyMarker) :
 void Terminal::Create(til::size viewportSize, til::CoordType scrollbackLines, Renderer& renderer)
 {
     _mutableViewport = Viewport::FromDimensions({ 0, 0 }, viewportSize);
-    _infiniteScrollback = scrollbackLines == -1;
+    _infiniteScrollback = scrollbackLines == UNLIMITED_HISTORY_SIZE;
     _scrollbackLines = _infiniteScrollback ? 0 : Utils::ClampToShortMax(scrollbackLines, 0);
     const til::size bufferSize{ viewportSize.width,
                                 Utils::ClampToShortMax(viewportSize.height + _scrollbackLines, 1) };
@@ -80,7 +80,7 @@ void Terminal::CreateFromSettings(ICoreSettings settings,
                                   Utils::ClampToShortMax(settings.InitialRows(), 1) };
 
     const auto historySize = settings.HistorySize();
-    Create(viewportSize, historySize == -1 ? -1 : Utils::ClampToShortMax(historySize, 0), renderer);
+    Create(viewportSize, historySize == UNLIMITED_HISTORY_SIZE ? UNLIMITED_HISTORY_SIZE : Utils::ClampToShortMax(historySize, 0), renderer);
 
     UpdateSettings(settings);
 }
@@ -1560,8 +1560,11 @@ void Terminal::ColorSelection(const TextAttribute& attr, winrt::Microsoft::Termi
 {
     const auto colorSelection = [this](const til::point coordStartInclusive, const til::point coordEndExclusive, const TextAttribute& attr) {
         auto& textBuffer = _activeBuffer();
-        const auto spanLength = textBuffer.GetSize().CompareInBounds(coordEndExclusive, coordStartInclusive, true);
-        textBuffer.Write(OutputCellIterator(attr, spanLength), coordStartInclusive);
+        const auto spanLength = textBuffer.GetSize().GetCellDistance(coordStartInclusive, coordEndExclusive, true);
+        if (spanLength > 0)
+        {
+            textBuffer.Write(OutputCellIterator(attr, gsl::narrow<size_t>(spanLength)), coordStartInclusive);
+        }
     };
 
     for (const auto [start, end] : _GetSelectionSpans())
