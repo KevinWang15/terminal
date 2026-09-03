@@ -653,16 +653,12 @@ void TextBufferTests::TestGrowableMarkRowsAreIndexed()
     TextAttribute commandAttributes;
     commandAttributes.SetMarkAttributes(MarkKind::Command);
 
-    auto& firstCommandRow = commandBuffer.GetMutableRowByOffset(1);
-    firstCommandRow.ReplaceCharacters(0, 5, { L"$ one" });
-    firstCommandRow.ReplaceAttributes(0, 2, promptAttributes);
-    firstCommandRow.ReplaceAttributes(2, 5, commandAttributes);
+    commandBuffer.Write(OutputCellIterator{ L"$ ", promptAttributes }, { 0, 1 });
+    commandBuffer.Write(OutputCellIterator{ L"one", commandAttributes }, { 2, 1 });
     commandBuffer.SetScrollbarData(warningMark, 1);
 
-    auto& secondCommandRow = commandBuffer.GetMutableRowByOffset(3);
-    secondCommandRow.ReplaceCharacters(0, 5, { L"$ two" });
-    secondCommandRow.ReplaceAttributes(0, 2, promptAttributes);
-    secondCommandRow.ReplaceAttributes(2, 5, commandAttributes);
+    commandBuffer.Write(OutputCellIterator{ L"$ ", promptAttributes }, { 0, 3 });
+    commandBuffer.Write(OutputCellIterator{ L"two", commandAttributes }, { 2, 3 });
     commandBuffer.SetScrollbarData(errorMark, 3);
     commandBuffer.GetCursor().SetPosition({ 5, 3 });
 
