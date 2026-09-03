@@ -1,0 +1,182 @@
+name: Build and test portable Terminal (x64)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portable-terminal-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Release x64
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Add 64-bit VS 2026 MSBuild to PATH
+        uses: microsoft/setup-msbuild@v3
+        with:
+          vs-version: '[18.0,19.0)'
+          msbuild-architecture: x64
+
+      - name: Verify toolchain and configure vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsRoot = & $vswhere -latest -products '*' -version '[18.0,19.0)' `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if ([string]::IsNullOrWhiteSpace([string]$vsRoot)) {
+            throw 'The hosted runner does not contain the required VS 2026 components.'
+          }
+          $vsRoot = ([string]$vsRoot).Trim()
+
+          $vcpkgRoot = Join-Path $vsRoot 'VC\vcpkg'
+          if (!(Test-Path (Join-Path $vcpkgRoot 'vcpkg.exe'))) {
+            throw "vcpkg is missing at $vcpkgRoot"
+          }
+
+          # The repository's Set-LatestVCToolsVersion script emits an Azure
+          # Pipelines variable, so set the equivalent GitHub Actions variable.
+          $vcTools = Get-ChildItem (Join-Path $vsRoot 'VC\Tools\MSVC') -Directory |
+            Sort-Object { [version]$_.Name } -Descending |
+            Select-Object -First 1
+          if (!$vcTools) { throw 'No MSVC toolset was found.' }
+
+          "VCPKG_ROOT=$vcpkgRoot" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "VCToolsVersion=$($vcTools.Name)" | Add-Content -LiteralPath $env:GITHUB_ENV
+
+          $kitsRoot = Get-ItemPropertyValue 'HKLM:\Software\Microsoft\Windows Kits\Installed Roots' KitsRoot10
+          foreach ($tool in @(
+            'bin\10.0.26100.0\x86\MakeAppx.exe',
+            'bin\10.0.26100.0\x86\MakePri.exe',
+            'bin\10.0.26100.0\x64\MakeAppx.exe',
+            'bin\10.0.26100.0\x64\MakePri.exe'
+          )) {
+            if (!(Test-Path (Join-Path $kitsRoot $tool))) {
+              throw "Windows SDK tool is missing: $tool"
+            }
+          }
+
+          msbuild.exe -version
+
+      - name: Restore dependencies
+        shell: pwsh
+        env:
+          NUGET_RESTORE_MSBUILD_ARGS: /p:Platform=x64
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\dep\nuget\nuget.exe restore .\build\packages.config -PackagesDirectory .\packages -ConfigFile .\NuGet.config -NonInteractive
+          if ($LASTEXITCODE -ne 0) { throw "build package restore failed: $LASTEXITCODE" }
+
+          msbuild.exe .\OpenConsole.slnx /t:Restore /m /p:Platform=x64 /p:Configuration=Release
+          if ($LASTEXITCODE -ne 0) { throw "solution restore failed: $LASTEXITCODE" }
+
+          & .\dep\nuget\nuget.exe restore .\dep\nuget\packages.config -PackagesDirectory .\packages -ConfigFile .\NuGet.config -NonInteractive
+          if ($LASTEXITCODE -ne 0) { throw "global package restore failed: $LASTEXITCODE" }
+
+      - name: Generate third-party notice
+        shell: pwsh
+        run: .\build\scripts\Generate-ThirdPartyNotices.ps1 -MarkdownNoticePath .\NOTICE.md -OutputPath .\src\cascadia\CascadiaPackage\NOTICE.html
+
+      - name: Build Release x64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $arguments = @(
+            '.\OpenConsole.slnx'
+            '/m'
+            '/p:Platform=x64'
+            '/p:Configuration=Release'
+            '/p:WindowsTerminalOfficialBuild=true'
+            '/p:WindowsTerminalBranding=Dev'
+            '/p:PGOBuildMode=None'
+            '/p:AppxSymbolPackageEnabled=false'
+            '/bl:msbuild.binlog'
+          )
+          msbuild.exe @arguments
+          if ($LASTEXITCODE -ne 0) { throw "build failed: $LASTEXITCODE" }
+
+      - name: Validate package and create portable ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packageRoot = '.\src\cascadia\CascadiaPackage\AppPackages'
+          $msix = @(Get-ChildItem $packageRoot -Recurse -File -Filter 'CascadiaPackage*.msix' |
+            Where-Object { $_.FullName -notmatch '[\\/]Dependencies[\\/]' })
+          if ($msix.Count -ne 1) {
+            throw "Expected exactly one Terminal MSIX, found $($msix.Count): $($msix.FullName -join ', ')"
+          }
+
+          $xaml = @(Get-ChildItem $packageRoot -Recurse -File -Filter 'Microsoft.UI.Xaml*.appx' |
+            Where-Object { $_.FullName -match '[\\/]Dependencies[\\/]x64[\\/]' })
+          if ($xaml.Count -ne 1) {
+            throw "Expected exactly one x64 Microsoft.UI.Xaml APPX, found $($xaml.Count): $($xaml.FullName -join ', ')"
+          }
+
+          .\build\scripts\Test-WindowsTerminalPackage.ps1 -Verbose -Path $msix[0].FullName
+
+          $destination = '.\bin\x64\Release\_unpackaged'
+          .\build\scripts\New-UnpackagedTerminalDistribution.ps1 `
+            -PortableMode `
+            -TerminalAppX $msix[0].FullName `
+            -XamlAppX $xaml[0].FullName `
+            -Destination $destination
+
+          $zip = @(Get-ChildItem $destination -File -Filter '*.zip')
+          if ($zip.Count -ne 1) { throw "Expected exactly one portable ZIP, found $($zip.Count)" }
+
+          $entries = & tar.exe -tf $zip[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the portable ZIP.' }
+          if (!($entries | Where-Object { $_ -match '(^|[\\/])WindowsTerminal\.exe$' })) {
+            throw 'Portable ZIP does not contain WindowsTerminal.exe.'
+          }
+          if (!($entries | Where-Object { $_ -match '(^|[\\/])\.portable$' })) {
+            throw 'Portable ZIP does not contain the .portable marker.'
+          }
+
+      - name: Run native unit tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = (Resolve-Path '.\bin\x64\Release').Path
+          foreach ($testBinary in @(
+            'Conhost.Unit.Tests.dll',
+            'Terminal.Core.Unit.Tests.dll',
+            'Control.Unit.Tests.dll',
+            'SettingsModel.Unit.Tests.dll'
+          )) {
+            if (!(Get-ChildItem $root -Recurse -File -Filter $testBinary | Select-Object -First 1)) {
+              throw "Test binary was not built: $testBinary"
+            }
+          }
+
+          # This script exits with TAEF's aggregate result, so keep it last.
+          & .\build\scripts\Run-Tests.ps1 -MatchPattern '*unit.test*.dll' -Platform x64 -Configuration Release -Root $root
+
+      - name: Upload portable build
+        if: ${{ always() && hashFiles('bin/x64/Release/_unpackaged/*.zip') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: terminal-infinite-scrollback-x64
+          path: bin/x64/Release/_unpackaged/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload MSBuild diagnostics
+        if: ${{ always() && hashFiles('msbuild.binlog') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: terminal-infinite-scrollback-build-log
+          path: msbuild.binlog
+          compression-level: 0
+          retention-days: 14
