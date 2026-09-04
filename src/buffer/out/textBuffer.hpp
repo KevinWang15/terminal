@@ -161,11 +161,11 @@ public:
 
     void ResizeTraditional(const til::size newSize);
 
-    // Extends a growable buffer by one logical row, allocating another storage
-    // block only when needed. This lets unlimited scrollback append history
-    // without relocating existing rows. Returns false only when the coordinate
-    // space has been exhausted.
-    bool GrowHeight();
+    // Extends a growable buffer to the requested logical height. All newly
+    // addressable rows are committed before the height changes; false leaves
+    // the logical buffer unchanged. GrowHeight is the one-row convenience API.
+    bool TryGrowToHeight(til::CoordType targetHeight) noexcept;
+    bool GrowHeight() noexcept;
     bool IsGrowable() const noexcept;
 
     void SetAsActiveBuffer(const bool isActiveBuffer) noexcept;

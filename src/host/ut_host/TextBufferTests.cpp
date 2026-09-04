@@ -100,6 +100,8 @@ class TextBufferTests
     TEST_METHOD(TestFiniteBufferUsesContiguousStorage);
     TEST_METHOD(TestDecommitReleasesPartialBlockTail);
     TEST_METHOD(TestGrowableBufferCrossesStorageBlocks);
+    TEST_METHOD(TestGrowableHeightPublicationIsTransactional);
+    TEST_METHOD(TestGrowableReflowFailureIsReported);
     TEST_METHOD(TestGrowableBufferClearReleasesStorageBlocks);
     TEST_METHOD(TestGrowableMarkRowsAreIndexed);
 
@@ -553,6 +555,64 @@ void TextBufferTests::TestGrowableBufferCrossesStorageBlocks()
     }
 }
 
+void TextBufferTests::TestGrowableHeightPublicationIsTransactional()
+{
+    TextBuffer buffer{ { 8, 2 }, TextAttribute{}, 12, false, &_renderer, true };
+
+    const auto originalHeight = buffer.TotalRowCount();
+    VERIFY_IS_TRUE(buffer.GrowHeight());
+    VERIFY_ARE_EQUAL(originalHeight + 1, buffer.TotalRowCount());
+
+    // Grow across a storage-block boundary in one transaction. The final
+    // logical row must already contain a live ROW before the target height is
+    // published, so resetting it cannot move the commit boundary.
+    const auto targetHeight = gsl::narrow_cast<til::CoordType>(buffer._rowsPerBlock) + 2;
+    VERIFY_IS_TRUE(buffer.TryGrowToHeight(targetHeight));
+    VERIFY_ARE_EQUAL(targetHeight, buffer.TotalRowCount());
+    VERIFY_IS_TRUE(buffer._committedRowCount > gsl::narrow_cast<size_t>(buffer.TotalRowCount()));
+    const auto committedAfterGrowth = buffer._committedRowCount;
+    buffer.ResetRow(buffer.TotalRowCount() - 1, TextAttribute{});
+    VERIFY_ARE_EQUAL(committedAfterGrowth, buffer._committedRowCount);
+
+    // Rejected preconditions are deterministic failure seams. They verify the
+    // same externally observable transaction boundary without claiming to
+    // inject an operating-system allocation failure.
+    const auto grownHeight = buffer.TotalRowCount();
+    const auto blockCount = buffer._rowBlocks.size();
+    const auto committedRowCount = buffer._committedRowCount;
+    buffer._firstRow = 1;
+    VERIFY_IS_FALSE(buffer.TryGrowToHeight(grownHeight + 1));
+    VERIFY_ARE_EQUAL(grownHeight, buffer.TotalRowCount());
+    VERIFY_ARE_EQUAL(blockCount, buffer._rowBlocks.size());
+    VERIFY_ARE_EQUAL(committedRowCount, buffer._committedRowCount);
+    buffer._firstRow = 0;
+
+    VERIFY_IS_FALSE(buffer.TryGrowToHeight(til::CoordTypeMax / 2 + 1));
+    VERIFY_ARE_EQUAL(grownHeight, buffer.TotalRowCount());
+    VERIFY_ARE_EQUAL(blockCount, buffer._rowBlocks.size());
+    VERIFY_ARE_EQUAL(committedRowCount, buffer._committedRowCount);
+}
+
+void TextBufferTests::TestGrowableReflowFailureIsReported()
+{
+    TextBuffer oldBuffer{ { 8, 2 }, TextAttribute{}, 12, false, &_renderer, true };
+    oldBuffer.GetMutableRowByOffset(0).ReplaceCharacters(0, 8, std::wstring_view{ L"ABCDEFGH" });
+
+    // A rotated growable buffer cannot append. Use that state as a lightweight
+    // failure seam: narrowing this row needs four destination rows, so Reflow
+    // must report the failed growth instead of returning a partial buffer.
+    TextBuffer newBuffer{ { 2, 2 }, TextAttribute{}, 12, false, &_renderer, true };
+    newBuffer._firstRow = 1;
+
+    VERIFY_THROWS_SPECIFIC(TextBuffer::Reflow(oldBuffer, newBuffer),
+                           wil::ResultException,
+                           [](wil::ResultException& exception) { return exception.GetErrorCode() == E_OUTOFMEMORY; });
+
+    VERIFY_ARE_EQUAL(til::CoordType{ 2 }, oldBuffer.TotalRowCount());
+    VERIFY_ARE_EQUAL(std::wstring_view{ L"ABCDEFGH" }, oldBuffer.GetRowByOffset(0).GetText());
+    VERIFY_ARE_EQUAL(til::CoordType{ 2 }, newBuffer.TotalRowCount());
+}
+
 void TextBufferTests::TestGrowableBufferClearReleasesStorageBlocks()
 {
     TextBuffer textBuffer{ { 8, 2 }, TextAttribute{}, 12, false, &_renderer, true };
@@ -622,6 +682,11 @@ void TextBufferTests::TestGrowableMarkRowsAreIndexed()
     buffer.ClearMarksInRange({ 0, 4 }, { 7, 4 });
     VERIFY_ARE_EQUAL(size_t{ 2 }, buffer._scrollMarkRows.size());
 
+    // This row is outside the retained range. Clearing growable scrollback
+    // rebuilds the sparse index from retained rows and must not leave it stale.
+    buffer.SetScrollbarData(warningMark, 5);
+    VERIFY_ARE_EQUAL(size_t{ 3 }, buffer._scrollMarkRows.size());
+
     buffer.ClearScrollback(1, 3);
 
     marks = buffer.GetMarkRows();
@@ -630,6 +695,7 @@ void TextBufferTests::TestGrowableMarkRowsAreIndexed()
     VERIFY_IS_TRUE(MarkCategory::Warning == marks[0].data.category);
     VERIFY_ARE_EQUAL(til::CoordType{ 2 }, marks[1].row);
     VERIFY_IS_TRUE(MarkCategory::Error == marks[1].data.category);
+    VERIFY_ARE_EQUAL(size_t{ 2 }, buffer._scrollMarkRows.size());
 
     buffer.ResetRow(2, TextAttribute{});
     VERIFY_IS_FALSE(buffer.GetRowByOffset(2).GetScrollbarData().has_value());

@@ -316,6 +316,56 @@ try
         return S_OK;
     }
 
+    // Changing only the viewport height cannot alter line wrapping. In an
+    // unlimited buffer, all rows have stable coordinates and can therefore be
+    // kept in place instead of copying the entire history into a second
+    // buffer. This is particularly important for terminals with very deep
+    // scrollback, where a routine window-height change would otherwise be
+    // proportional to every row retained so far.
+    if (_infiniteScrollback && viewportSize.width == oldDimensions.width)
+    {
+        const auto originalOffsetWasZero = _scrollOffset == 0;
+        const auto originalVisibleTop = _VisibleStartIndex();
+        const auto cursorPos = _mainBuffer->GetCursor().GetPosition();
+        const auto lastChar = _mainBuffer->GetLastNonSpaceCharacter(&_mutableViewport);
+        const auto maxRow = std::max(lastChar.y, cursorPos.y);
+
+        // A newly enlarged viewport may be taller than the initial buffer.
+        // Prepare every missing row before publishing the new buffer height,
+        // so an allocation failure leaves the existing state unchanged.
+        if (!_mainBuffer->TryGrowToHeight(viewportSize.height))
+        {
+            return E_OUTOFMEMORY;
+        }
+
+        // Match the vertical placement used by the reflow path. Shrinking
+        // keeps the old top unless that would leave the cursor or final text
+        // below the viewport. Growing expands upward when there is retained
+        // history available.
+        const auto proposedTopFromLastLine = maxRow - viewportSize.height + 1;
+        auto proposedTop = std::max(_mutableViewport.Top(), proposedTopFromLastLine);
+        proposedTop = std::max(0, proposedTop);
+
+        const auto proposedView = Viewport::FromDimensions({ 0, proposedTop }, viewportSize);
+        const auto proposedBottom = proposedView.BottomExclusive();
+        const auto actualBufferHeight = _mainBuffer->GetSize().Height();
+        if (proposedBottom > actualBufferHeight)
+        {
+            proposedTop = ::base::ClampSub(proposedTop, ::base::ClampSub(proposedBottom, actualBufferHeight));
+        }
+
+        // The mutable viewport must always contain the cursor.
+        proposedTop = std::min(proposedTop, cursorPos.y);
+        _mutableViewport = Viewport::FromDimensions({ 0, proposedTop }, viewportSize);
+
+        const auto newVisibleTop = std::clamp(originalVisibleTop, 0, _mutableViewport.Top());
+        _scrollOffset = originalOffsetWasZero ? 0 : static_cast<int>(::base::ClampSub(_mutableViewport.Top(), newVisibleTop));
+
+        _mainBuffer->TriggerRedrawAll();
+        _NotifyScrollEvent();
+        return S_OK;
+    }
+
     // A growable buffer starts at the viewport height. Reflow appends exactly
     // as many rows as the retained logical content needs, which also releases
     // rows made redundant by widening the terminal.

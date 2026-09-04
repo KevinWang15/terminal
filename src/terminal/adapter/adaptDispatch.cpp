@@ -2463,7 +2463,9 @@ bool AdaptDispatch::_DoLineFeed(const Page& page, const bool withReturn, const b
         // If the top margin is at the top of the page, then we'll scroll
         // the content up by panning the viewport down, and also move the cursor
         // down a row. But we only do this if the viewport hasn't yet reached
-        // the end of the buffer.
+        // the end of the buffer. GrowHeight commits the newly exposed row
+        // before returning true, so none of the state changes below can reveal
+        // an unconstructed row.
         _api.SetViewportPosition({ page.XPanOffset(), page.Top() + 1 });
         newPosition.y++;
         viewportMoved = true;
@@ -2484,8 +2486,9 @@ bool AdaptDispatch::_DoLineFeed(const Page& page, const bool withReturn, const b
     else
     {
         // If the viewport has reached the end of the buffer, we can't pan down,
-        // so we cycle the row coordinates, which effectively scrolls the buffer
-        // content up. In this case we don't need to move the cursor down.
+        // or a growable buffer couldn't allocate another row, so we cycle the
+        // row coordinates. Failed growth leaves the existing height unchanged,
+        // making this a safe bounded-history fallback.
         const auto eraseAttributes = _GetEraseAttributes(page);
         textBuffer.IncrementCircularBuffer(eraseAttributes);
         _api.NotifyBufferRotation(1);

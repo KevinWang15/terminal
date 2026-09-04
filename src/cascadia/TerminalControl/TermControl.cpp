@@ -705,7 +705,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
                     {
                         self->_searchScrollOffset = self->_calculateSearchScrollOffset();
                         self->_searchBox->SetFocusOnTextbox();
-                        self->_refreshSearch(SearchRequestOrigin::Explicit);
+                        self->_refreshSearch(SearchRefreshReason::Explicit);
                     }
                 });
             }
@@ -733,7 +733,6 @@ namespace winrt::Microsoft::Terminal::Control::implementation
                 .ExecuteSearch = true,
                 .ScrollIntoView = true,
                 .ScrollOffset = _searchScrollOffset,
-                .Origin = SearchRequestOrigin::Explicit,
             }));
         }
     }
@@ -776,7 +775,6 @@ namespace winrt::Microsoft::Terminal::Control::implementation
                 .ExecuteSearch = true,
                 .ScrollIntoView = true,
                 .ScrollOffset = _searchScrollOffset,
-                .Origin = SearchRequestOrigin::Explicit,
             }));
         }
     }
@@ -804,7 +802,6 @@ namespace winrt::Microsoft::Terminal::Control::implementation
                 .ExecuteSearch = false,
                 .ScrollIntoView = true,
                 .ScrollOffset = _searchScrollOffset,
-                .Origin = SearchRequestOrigin::Explicit,
             }));
         }
     }
@@ -3782,7 +3779,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         return _core.SelectedText(trimTrailingWhitespace);
     }
 
-    void TermControl::_refreshSearch(const SearchRequestOrigin origin)
+    void TermControl::_refreshSearch(const SearchRefreshReason reason)
     {
         if (!_searchBox || !_searchBox->IsOpen())
         {
@@ -3798,7 +3795,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         const auto goForward = _searchBox->GoForward();
         const auto caseSensitive = _searchBox->CaseSensitive();
         const auto regularExpression = _searchBox->RegularExpression();
-        _handleSearchResults(_core.Search(SearchRequest{
+        const SearchRequest request{
             .Text = text,
             .GoForward = goForward,
             .CaseSensitive = caseSensitive,
@@ -3806,11 +3803,19 @@ namespace winrt::Microsoft::Terminal::Control::implementation
             .ExecuteSearch = false,
             .ScrollIntoView = false,
             .ScrollOffset = _searchScrollOffset,
-            .Origin = origin,
-        }));
+        };
+
+        if (reason == SearchRefreshReason::OutputIdle)
+        {
+            _handleSearchResults(get_self<ControlCore>(_core)->SearchFromOutputIdle(request));
+        }
+        else
+        {
+            _handleSearchResults(_core.Search(request));
+        }
     }
 
-    void TermControl::_handleSearchResults(SearchResults results)
+    void TermControl::_handleSearchResults(const std::optional<SearchResults>& results)
     {
         if (!_searchBox)
         {
@@ -3818,16 +3823,18 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         }
 
         // Only show status when we have a search term
-        if (_searchBox->Text().empty() || results.SearchResultsStale)
+        if (_searchBox->Text().empty() || !results)
         {
             _searchBox->ClearStatus();
         }
         else
         {
-            _searchBox->SetStatus(results.TotalMatches, results.CurrentMatch, results.SearchRegexInvalid);
+            _searchBox->SetStatus(results->TotalMatches, results->CurrentMatch, results->SearchRegexInvalid);
         }
 
-        if (results.SearchInvalidated)
+        // A missing result means that output invalidated the search, but that a
+        // passive rescan was skipped because the growable history is too large.
+        if (!results || results->SearchInvalidated)
         {
             if (_showMarksInScrollbar)
             {
@@ -3842,11 +3849,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
             }
         }
 
-        if (!results.SearchResultsStale)
+        if (results)
         {
             if (auto automationPeer{ FrameworkElementAutomationPeer::FromElement(*this) })
             {
-                const auto status = _searchBox->GetAccessibleStatus(results.TotalMatches, results.CurrentMatch, results.SearchRegexInvalid);
+                const auto status = _searchBox->GetAccessibleStatus(results->TotalMatches, results->CurrentMatch, results->SearchRegexInvalid);
                 if (!status.empty())
                 {
                     automationPeer.RaiseNotificationEvent(
@@ -3861,7 +3868,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
 
     void TermControl::_coreOutputIdle(const IInspectable& /*sender*/, const IInspectable& /*args*/)
     {
-        _refreshSearch(SearchRequestOrigin::OutputIdle);
+        _refreshSearch(SearchRefreshReason::OutputIdle);
     }
 
     void TermControl::OwningHwnd(uint64_t owner)

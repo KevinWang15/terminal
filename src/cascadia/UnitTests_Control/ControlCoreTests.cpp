@@ -154,8 +154,8 @@ namespace ControlUnitTests
 
         conn->WriteInput(winrt_wstring_to_array_view(L"needle\r\nneedle"));
 
-        const auto search = [&](const wchar_t* text, const bool goForward, const bool executeSearch, const Control::SearchRequestOrigin origin) {
-            return core->Search(Control::SearchRequest{
+        const auto searchRequest = [&](const wchar_t* text, const bool goForward, const bool executeSearch) {
+            return Control::SearchRequest{
                 .Text = winrt::hstring{ text },
                 .GoForward = goForward,
                 .CaseSensitive = true,
@@ -163,25 +163,24 @@ namespace ControlUnitTests
                 .ExecuteSearch = executeSearch,
                 .ScrollIntoView = false,
                 .ScrollOffset = 0,
-                .Origin = origin,
-            });
+            };
         };
 
         Log::Comment(L"An explicit search scans the entire growable buffer.");
-        auto results = search(L"needle", true, false, Control::SearchRequestOrigin::Explicit);
+        auto results = core->Search(searchRequest(L"needle", true, false));
         VERIFY_ARE_EQUAL(2, results.TotalMatches);
         VERIFY_ARE_EQUAL(0, results.CurrentMatch);
-        VERIFY_IS_FALSE(results.SearchResultsStale);
 
         conn->WriteInput(winrt_wstring_to_array_view(L"x"));
-        results = search(L"needle", true, false, Control::SearchRequestOrigin::OutputIdle);
+        auto passiveResults = core->SearchFromOutputIdle(searchRequest(L"needle", true, false));
+        VERIFY_IS_TRUE(passiveResults.has_value());
+        results = *passiveResults;
         VERIFY_IS_TRUE(results.SearchInvalidated);
-        VERIFY_IS_FALSE(results.SearchResultsStale);
         VERIFY_ARE_EQUAL(2, results.TotalMatches);
 
         // Leave the second result focused so a skipped passive refresh must
         // preserve its anchor for the next explicit navigation request.
-        results = search(L"needle", true, true, Control::SearchRequestOrigin::Explicit);
+        results = core->Search(searchRequest(L"needle", true, true));
         VERIFY_ARE_EQUAL(1, results.CurrentMatch);
 
         auto& textBuffer = core->_terminal->GetTextBuffer();
@@ -199,29 +198,25 @@ namespace ControlUnitTests
         conn->WriteInput(winrt_wstring_to_array_view(L"y"));
 
         Log::Comment(L"An output-idle refresh clears stale results without rescanning unbounded history.");
-        results = search(L"needle", true, false, Control::SearchRequestOrigin::OutputIdle);
-        VERIFY_IS_TRUE(results.SearchInvalidated);
-        VERIFY_IS_TRUE(results.SearchResultsStale);
-        VERIFY_ARE_EQUAL(0, results.TotalMatches);
+        passiveResults = core->SearchFromOutputIdle(searchRequest(L"needle", true, false));
+        VERIFY_IS_FALSE(passiveResults.has_value());
         VERIFY_IS_TRUE(core->SearchResultRows().empty());
 
-        results = search(L"needle", true, false, Control::SearchRequestOrigin::OutputIdle);
-        VERIFY_IS_TRUE(results.SearchResultsStale);
+        passiveResults = core->SearchFromOutputIdle(searchRequest(L"needle", true, false));
+        VERIFY_IS_FALSE(passiveResults.has_value());
         VERIFY_IS_TRUE(core->SearchResultRows().empty());
 
         Log::Comment(L"Find Next and Previous remain explicit, complete searches.");
-        results = search(L"needle", true, true, Control::SearchRequestOrigin::Explicit);
-        VERIFY_IS_FALSE(results.SearchResultsStale);
+        results = core->Search(searchRequest(L"needle", true, true));
         VERIFY_ARE_EQUAL(2, results.TotalMatches);
         VERIFY_ARE_EQUAL(0, results.CurrentMatch);
 
-        results = search(L"needle", false, true, Control::SearchRequestOrigin::Explicit);
+        results = core->Search(searchRequest(L"needle", false, true));
         VERIFY_ARE_EQUAL(2, results.TotalMatches);
         VERIFY_ARE_EQUAL(1, results.CurrentMatch);
 
         Log::Comment(L"Changing the criteria also performs a complete explicit search.");
-        results = search(L"needlexy", true, false, Control::SearchRequestOrigin::Explicit);
-        VERIFY_IS_FALSE(results.SearchResultsStale);
+        results = core->Search(searchRequest(L"needlexy", true, false));
         VERIFY_ARE_EQUAL(1, results.TotalMatches);
     }
 

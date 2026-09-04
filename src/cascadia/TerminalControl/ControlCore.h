@@ -224,6 +224,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         void SetEndSelectionPoint(const til::point position);
 
         SearchResults Search(const SearchRequest& request);
+        std::optional<SearchResults> SearchFromOutputIdle(const SearchRequest& request);
         const std::vector<til::point_span>& SearchResultRows() const noexcept;
         void ClearSearch();
 
@@ -321,6 +322,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
 
         void _handleControlC();
         void _sendInputToConnection(std::wstring_view wstr);
+        std::optional<SearchResults> _search(const SearchRequest& request, bool skipIfHistoryIsLarge);
 
 #pragma region TerminalCoreCallbacks
         void _terminalWarningBell();

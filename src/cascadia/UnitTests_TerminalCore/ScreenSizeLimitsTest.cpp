@@ -36,6 +36,9 @@ namespace TerminalCoreUnitTests
 
         TEST_METHOD(ResizeIsClampedToBounds);
         TEST_METHOD(InfiniteHistorySurvivesReflow);
+        TEST_METHOD(InfiniteHistorySurvivesRepeatedMultiBlockReflow);
+        TEST_METHOD(InfiniteHistoryHeightOnlyResizeKeepsBuffer);
+        TEST_METHOD(InfiniteHistoryHeightOnlyResizeGrowsBuffer);
     };
 }
 
@@ -345,4 +348,194 @@ void ScreenSizeLimitsTest::InfiniteHistorySurvivesReflow()
     const auto heightAfterResize = textBuffer.TotalRowCount();
     terminal.Write(L"after-resize\r\n");
     VERIFY_IS_TRUE(terminal.GetTextBuffer().TotalRowCount() > heightAfterResize);
+}
+
+void ScreenSizeLimitsTest::InfiniteHistorySurvivesRepeatedMultiBlockReflow()
+{
+    static constexpr til::CoordType viewportHeight = 4;
+    static constexpr til::CoordType initialWidth = 32;
+    static constexpr std::wstring_view firstAnchor{ L"first-anchor" };
+    static constexpr std::wstring_view tailAnchor{ L"tailmark" };
+    auto settings = winrt::make<MockTermSettings>(-1, viewportHeight, initialWidth);
+    Terminal terminal{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &terminal };
+    terminal.CreateFromSettings(settings, renderer);
+
+    // More than 4096 rows guarantees that the growable buffer spans multiple
+    // storage blocks. The line width also forces wrapping at the narrow sizes.
+    std::wstring output{ firstAnchor };
+    output.append(L"\r\n");
+    for (auto i = 0; i < 5000; ++i)
+    {
+        output.append(L"history-line\r\n");
+    }
+    output.append(tailAnchor);
+    output.append(L"\r\n");
+    terminal.Write(output);
+
+    const auto verifyAnchorsAndBounds = [&]() {
+        const auto& textBuffer = terminal.GetTextBuffer();
+        VERIFY_IS_TRUE(textBuffer.IsGrowable());
+        VERIFY_ARE_EQUAL(0, textBuffer.GetFirstRowIndex());
+        VERIFY_IS_TRUE(textBuffer.TotalRowCount() > 5000);
+
+        std::wstring actualFirstAnchor;
+        for (til::CoordType y = 0; y < textBuffer.TotalRowCount() && actualFirstAnchor.size() < firstAnchor.size(); ++y)
+        {
+            const auto& row = textBuffer.GetRowByOffset(y);
+            const auto rowText = row.GetText();
+            const auto remaining = firstAnchor.size() - actualFirstAnchor.size();
+            actualFirstAnchor.append(rowText.substr(0, std::min(rowText.size(), remaining)));
+            if (!row.WasWrapForced())
+            {
+                break;
+            }
+        }
+        VERIFY_ARE_EQUAL(std::wstring{ firstAnchor }, actualFirstAnchor, L"The first logical line must survive every reflow");
+
+        auto foundTailAnchor = false;
+        const auto firstCandidate = std::max<til::CoordType>(0, textBuffer.TotalRowCount() - 16);
+        for (auto y = firstCandidate; y < textBuffer.TotalRowCount(); ++y)
+        {
+            const auto rowText = textBuffer.GetRowByOffset(y).GetText();
+            if (rowText.size() >= tailAnchor.size() && rowText.substr(0, tailAnchor.size()) == tailAnchor)
+            {
+                foundTailAnchor = true;
+                break;
+            }
+        }
+        VERIFY_IS_TRUE(foundTailAnchor, L"The tail of the retained history must survive every reflow");
+
+        const auto cursor = textBuffer.GetCursor().GetPosition();
+        VERIFY_IS_TRUE(cursor.x >= 0 && cursor.x < textBuffer.GetSize().Width());
+        VERIFY_IS_TRUE(cursor.y >= 0 && cursor.y < textBuffer.TotalRowCount());
+    };
+
+    verifyAnchorsAndBounds();
+
+    static constexpr til::CoordType resizeWidths[]{ 10, 24, 14, 40, 16, initialWidth };
+    for (const auto width : resizeWidths)
+    {
+        VERIFY_SUCCEEDED(terminal.UserResize({ width, viewportHeight }));
+        VERIFY_ARE_EQUAL(width, terminal.GetViewport().Width());
+        verifyAnchorsAndBounds();
+    }
+
+    // Exercise the growth path again after the final reflow. More writes than
+    // the viewport height guarantee that at least one new row must be appended.
+    const auto heightAfterReflows = terminal.GetTextBuffer().TotalRowCount();
+    terminal.Write(L"post-reflow-0\r\npost-reflow-1\r\npost-reflow-2\r\npost-reflow-3\r\n"
+                   L"post-reflow-4\r\npost-reflow-5\r\npost-reflow-6\r\npost-reflow-7\r\n");
+    VERIFY_IS_TRUE(terminal.GetTextBuffer().TotalRowCount() > heightAfterReflows);
+    verifyAnchorsAndBounds();
+}
+
+void ScreenSizeLimitsTest::InfiniteHistoryHeightOnlyResizeKeepsBuffer()
+{
+    static constexpr til::CoordType initialHeight = 4;
+    static constexpr til::CoordType width = 16;
+    auto settings = winrt::make<MockTermSettings>(-1, initialHeight, width);
+    Terminal terminal{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &terminal };
+    terminal.CreateFromSettings(settings, renderer);
+
+    // More than 4096 rows guarantees that growable storage spans multiple
+    // blocks, regardless of the row width used by TextBuffer.
+    std::wstring output{ L"anchor\r\n" };
+    for (auto i = 0; i < 5000; ++i)
+    {
+        output.append(L"history-line\r\n");
+    }
+    terminal.Write(output);
+
+    terminal.UserScrollViewport(100);
+    const auto* const bufferBeforeResize = &terminal.GetTextBuffer();
+    const auto* const firstRowBeforeResize = &bufferBeforeResize->GetRowByOffset(0);
+    const auto* const laterRowBeforeResize = &bufferBeforeResize->GetRowByOffset(4097);
+    const auto heightBeforeResize = bufferBeforeResize->TotalRowCount();
+    const auto cursorBeforeResize = bufferBeforeResize->GetCursor().GetPosition();
+    const auto visibleTopBeforeResize = terminal.GetViewport().Top();
+
+    terminal.SetSelectionAnchor({ 0, 0 });
+    terminal.SetSelectionEnd({ 7, 0 });
+    const auto selectionAnchorBeforeResize = terminal.GetSelectionAnchor();
+    const auto selectionEndBeforeResize = terminal.GetSelectionEnd();
+    const auto selectedTextBeforeResize = terminal.RetrieveSelectedTextFromBuffer(false).plainText;
+
+    VERIFY_SUCCEEDED(terminal.UserResize({ width, 8 }));
+    VERIFY_IS_TRUE(bufferBeforeResize == &terminal.GetTextBuffer(), L"Height-only resize must retain the existing buffer");
+    VERIFY_IS_TRUE(firstRowBeforeResize == &terminal.GetTextBuffer().GetRowByOffset(0));
+    VERIFY_IS_TRUE(laterRowBeforeResize == &terminal.GetTextBuffer().GetRowByOffset(4097));
+    VERIFY_ARE_EQUAL(heightBeforeResize, terminal.GetTextBuffer().TotalRowCount());
+    VERIFY_ARE_EQUAL(cursorBeforeResize, terminal.GetTextBuffer().GetCursor().GetPosition());
+    VERIFY_ARE_EQUAL(visibleTopBeforeResize, terminal.GetViewport().Top());
+    VERIFY_ARE_EQUAL(selectionAnchorBeforeResize, terminal.GetSelectionAnchor());
+    VERIFY_ARE_EQUAL(selectionEndBeforeResize, terminal.GetSelectionEnd());
+    VERIFY_ARE_EQUAL(selectedTextBeforeResize, terminal.RetrieveSelectedTextFromBuffer(false).plainText);
+    VERIFY_ARE_EQUAL(8, terminal.GetViewport().Height());
+    VERIFY_ARE_EQUAL(std::wstring_view{ L"anchor" }, terminal.GetTextBuffer().GetRowByOffset(0).GetText().substr(0, 6));
+
+    VERIFY_SUCCEEDED(terminal.UserResize({ width, 2 }));
+    VERIFY_IS_TRUE(bufferBeforeResize == &terminal.GetTextBuffer(), L"Repeated height-only resize must retain the existing buffer");
+    VERIFY_IS_TRUE(firstRowBeforeResize == &terminal.GetTextBuffer().GetRowByOffset(0));
+    VERIFY_IS_TRUE(laterRowBeforeResize == &terminal.GetTextBuffer().GetRowByOffset(4097));
+    VERIFY_ARE_EQUAL(heightBeforeResize, terminal.GetTextBuffer().TotalRowCount());
+    VERIFY_ARE_EQUAL(cursorBeforeResize, terminal.GetTextBuffer().GetCursor().GetPosition());
+    VERIFY_ARE_EQUAL(visibleTopBeforeResize, terminal.GetViewport().Top());
+    VERIFY_ARE_EQUAL(selectionAnchorBeforeResize, terminal.GetSelectionAnchor());
+    VERIFY_ARE_EQUAL(selectionEndBeforeResize, terminal.GetSelectionEnd());
+    VERIFY_ARE_EQUAL(selectedTextBeforeResize, terminal.RetrieveSelectedTextFromBuffer(false).plainText);
+    VERIFY_ARE_EQUAL(2, terminal.GetViewport().Height());
+    VERIFY_ARE_EQUAL(std::wstring_view{ L"anchor" }, terminal.GetTextBuffer().GetRowByOffset(0).GetText().substr(0, 6));
+
+    // Return to the live viewport and verify that a height-only grow followed
+    // by a shrink continues following the bottom of this multi-block history.
+    terminal.ClearSelection();
+    terminal.UserScrollViewport(terminal.ViewStartIndex());
+    VERIFY_ARE_EQUAL(terminal.ViewStartIndex(), terminal.GetViewport().Top());
+    VERIFY_ARE_EQUAL(cursorBeforeResize.y, terminal.GetViewport().BottomInclusive());
+
+    VERIFY_SUCCEEDED(terminal.UserResize({ width, 7 }));
+    VERIFY_IS_TRUE(bufferBeforeResize == &terminal.GetTextBuffer());
+    VERIFY_ARE_EQUAL(heightBeforeResize, terminal.GetTextBuffer().TotalRowCount());
+    VERIFY_ARE_EQUAL(cursorBeforeResize, terminal.GetTextBuffer().GetCursor().GetPosition());
+    VERIFY_ARE_EQUAL(7, terminal.GetViewport().Height());
+    VERIFY_ARE_EQUAL(terminal.ViewStartIndex(), terminal.GetViewport().Top());
+    VERIFY_ARE_EQUAL(cursorBeforeResize.y, terminal.GetViewport().BottomInclusive());
+
+    VERIFY_SUCCEEDED(terminal.UserResize({ width, 3 }));
+    VERIFY_IS_TRUE(bufferBeforeResize == &terminal.GetTextBuffer());
+    VERIFY_ARE_EQUAL(heightBeforeResize, terminal.GetTextBuffer().TotalRowCount());
+    VERIFY_ARE_EQUAL(cursorBeforeResize, terminal.GetTextBuffer().GetCursor().GetPosition());
+    VERIFY_ARE_EQUAL(3, terminal.GetViewport().Height());
+    VERIFY_ARE_EQUAL(terminal.ViewStartIndex(), terminal.GetViewport().Top());
+    VERIFY_ARE_EQUAL(cursorBeforeResize.y, terminal.GetViewport().BottomInclusive());
+}
+
+void ScreenSizeLimitsTest::InfiniteHistoryHeightOnlyResizeGrowsBuffer()
+{
+    static constexpr til::CoordType initialHeight = 4;
+    static constexpr til::CoordType enlargedHeight = 5000;
+    static constexpr til::CoordType width = 16;
+    auto settings = winrt::make<MockTermSettings>(-1, initialHeight, width);
+    Terminal terminal{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &terminal };
+    terminal.CreateFromSettings(settings, renderer);
+
+    const auto* const bufferBeforeResize = &terminal.GetTextBuffer();
+    const auto* const firstRowBeforeResize = &bufferBeforeResize->GetRowByOffset(0);
+    const auto cursorBeforeResize = bufferBeforeResize->GetCursor().GetPosition();
+
+    // This crosses the maximum row-block size, exercising in-place storage
+    // growth as well as the viewport-only portion of the fast path.
+    VERIFY_SUCCEEDED(terminal.UserResize({ width, enlargedHeight }));
+    VERIFY_IS_TRUE(bufferBeforeResize == &terminal.GetTextBuffer());
+    VERIFY_IS_TRUE(firstRowBeforeResize == &terminal.GetTextBuffer().GetRowByOffset(0));
+    VERIFY_ARE_EQUAL(enlargedHeight, terminal.GetTextBuffer().TotalRowCount());
+    VERIFY_ARE_EQUAL(cursorBeforeResize, terminal.GetTextBuffer().GetCursor().GetPosition());
+    VERIFY_ARE_EQUAL((til::point{}), terminal.GetViewport().Origin());
+    VERIFY_ARE_EQUAL(enlargedHeight, terminal.GetViewport().Height());
+
+    terminal.Write(L"after-resize\r\n");
+    VERIFY_ARE_EQUAL(std::wstring_view{ L"after-resize" }, terminal.GetTextBuffer().GetRowByOffset(0).GetText().substr(0, 12));
 }

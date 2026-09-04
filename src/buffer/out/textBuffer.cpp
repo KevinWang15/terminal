@@ -1127,7 +1127,10 @@ void TextBuffer::ClearScrollback(const til::CoordType newFirstRow, const til::Co
         return;
     }
 
-    ClearMarksInRange(til::point{ 0, 0 }, til::point{ _width, std::max(0, newFirstRow - 1) });
+    if (!_growable)
+    {
+        ClearMarksInRange(til::point{ 0, 0 }, til::point{ _width, std::max(0, newFirstRow - 1) });
+    }
 
     // Our goal is to move the viewport to the absolute start of the underlying memory buffer so that we can
     // MEM_DECOMMIT the remaining memory. _firstRow is used to make the TextBuffer behave like a circular buffer.
@@ -1137,6 +1140,13 @@ void TextBuffer::ClearScrollback(const til::CoordType newFirstRow, const til::Co
     // operates modulo the buffer height and so the possibly-too-large startAbsolute won't be an issue.
     const auto startAbsolute = _firstRow + newFirstRow;
     _firstRow = 0;
+    if (_growable)
+    {
+        // Avoid walking every discarded row just to clear marks from unlimited
+        // history. CopyRow will rebuild this sparse index from the retained
+        // rows while moving them to their new coordinates below.
+        _scrollMarkRows.clear();
+    }
     ScrollRows(startAbsolute, rowsToKeep, -startAbsolute);
 
     _decommit(rowsToKeep);
@@ -1150,8 +1160,6 @@ void TextBuffer::ClearScrollback(const til::CoordType newFirstRow, const til::Co
         const auto storageRowCount = gsl::narrow_cast<size_t>(_height) + 1;
         const auto blockCount = (storageRowCount + _rowsPerBlock - 1) >> _rowBlockShift;
         _rowBlocks.resize(blockCount);
-        const auto firstDiscardedMark = std::lower_bound(_scrollMarkRows.begin(), _scrollMarkRows.end(), rowsToKeep);
-        _scrollMarkRows.erase(firstDiscardedMark, _scrollMarkRows.end());
     }
 
     // Unlimited buffers never rotate, so their hyperlink table grows with
@@ -1210,17 +1218,57 @@ void TextBuffer::ResizeTraditional(til::size newSize)
     _SetFirstRowIndex(0);
 }
 
-bool TextBuffer::GrowHeight()
+bool TextBuffer::TryGrowToHeight(const til::CoordType targetHeight) noexcept
 {
-    if (!_growable || _firstRow != 0 || _height >= til::CoordTypeMax / 2)
+    if (targetHeight <= _height)
+    {
+        return true;
+    }
+
+    if (!_growable || _firstRow != 0 || targetHeight > til::CoordTypeMax / 2)
     {
         return false;
     }
 
-    const auto nextHeight = _height + 1;
-    _reserveRows(gsl::narrow_cast<size_t>(nextHeight) + 1);
-    _height = nextHeight;
-    return true;
+    const auto previousBlockCount = _rowBlocks.size();
+
+    try
+    {
+        _reserveRows(gsl::narrow_cast<size_t>(targetHeight) + 1);
+
+        // Commit and construct every newly addressable row before publishing
+        // the larger height. Line feed and height-only resize both update their
+        // viewport state immediately after this returns, so allowing a later
+        // row access to be the first operation that can fail would leave those
+        // states out of sync with the buffer.
+        const auto lastRowStorageOffset = gsl::narrow_cast<size_t>(targetHeight);
+        if (lastRowStorageOffset >= _committedRowCount)
+        {
+            _commit(lastRowStorageOffset);
+        }
+
+        _height = targetHeight;
+        return true;
+    }
+    catch (...)
+    {
+        // _commit updates _committedRowCount only after every required page is
+        // committed and every ROW is constructed. It is therefore safe to
+        // release reservations appended by this attempt. Pages that happened
+        // to be committed in the previous final block contain no live objects
+        // and can be reused by a later attempt.
+        while (_rowBlocks.size() > previousBlockCount)
+        {
+            _rowBlocks.pop_back();
+        }
+        LOG_CAUGHT_EXCEPTION();
+        return false;
+    }
+}
+
+bool TextBuffer::GrowHeight() noexcept
+{
+    return _height < til::CoordTypeMax / 2 && TryGrowToHeight(_height + 1);
 }
 
 bool TextBuffer::IsGrowable() const noexcept
@@ -2968,8 +3016,9 @@ void TextBuffer::_SerializeRow(const ROW& row, const til::CoordType startX, cons
 // - positionInfo - Optional. The caller can provide a pair of rows in this
 //   parameter and we'll calculate the position of the _end_ of those rows in
 //   the new buffer. The rows's new value is placed back into this parameter.
-// Return Value:
-// - S_OK if we successfully copied the contents to the new buffer; otherwise, an appropriate HRESULT.
+// Exceptions:
+// - Throws if a growable destination cannot append enough rows. Callers must
+//   keep using the old buffer in that case; the destination may be incomplete.
 void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const Viewport* lastCharacterViewport, PositionInformation* positionInfo)
 {
     const auto& oldCursor = oldBuffer.GetCursor();
@@ -3005,13 +3054,13 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
     const auto ensureRowAvailable = [&](const til::CoordType row) {
         while (row >= newHeight && newBuffer.IsGrowable())
         {
-            if (!newBuffer.GrowHeight())
-            {
-                return false;
-            }
+            // Reflow builds a replacement buffer which is installed only after
+            // this function returns. Treat an inability to grow as a hard
+            // failure so the caller retains the complete old buffer instead of
+            // swapping in a silently truncated replacement.
+            THROW_HR_IF(E_OUTOFMEMORY, !newBuffer.GrowHeight());
             newHeight = newBuffer.GetSize().Height();
         }
-        return true;
     };
 
     // Copy oldBuffer into newBuffer until oldBuffer has been fully consumed.
@@ -3032,10 +3081,7 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
                 newY++;
             }
 
-            if (!ensureRowAvailable(newY))
-            {
-                break;
-            }
+            ensureRowAvailable(newY);
 
             // See the comment marked with "REFLOW_RESET".
             if (newY >= newHeight)
@@ -3090,10 +3136,7 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
         //   single row, that's fine! The mark was on that logical row.
         if (oldRow.GetScrollbarData().has_value())
         {
-            if (!ensureRowAvailable(newY))
-            {
-                break;
-            }
+            ensureRowAvailable(newY);
             newBuffer.SetScrollbarData(*oldRow.GetScrollbarData(), newY);
         }
 
@@ -3115,10 +3158,7 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
                 newY++;
             }
 
-            if (!ensureRowAvailable(newY))
-            {
-                break;
-            }
+            ensureRowAvailable(newY);
 
             // REFLOW_RESET:
             // If we shrink the buffer vertically, for instance from 100 rows to 90 rows, we will write 10 rows in the
@@ -3212,10 +3252,7 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
     const auto initializedRowsEnd = oldBuffer._estimateOffsetOfLastCommittedRow() + 1;
     for (; oldY < initializedRowsEnd && (newY < newHeight || newBuffer.IsGrowable()); oldY++, newY++)
     {
-        if (!ensureRowAvailable(newY))
-        {
-            break;
-        }
+        ensureRowAvailable(newY);
 
         auto& oldRow = oldBuffer.GetRowByOffset(oldY);
         auto& newRow = newBuffer.GetMutableRowByOffset(newY);

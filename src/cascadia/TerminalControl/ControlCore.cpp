@@ -1766,14 +1766,30 @@ namespace winrt::Microsoft::Terminal::Control::implementation
     }
 
     // Method Description:
-    // - Searches the text buffer and optionally moves to the next match. Explicit
-    //   requests always scan the full retained history. Output-idle refreshes are
-    //   skipped once a growable buffer exceeds the bounded automatic-search limit.
+    // - Searches the text buffer and optionally moves to the next match. Searches
+    //   explicitly requested through the projected API always scan the full retained
+    //   history.
     // Arguments:
-    // - request: The search criteria, action, and origin.
+    // - request: The search criteria and action.
     // Return Value:
-    // - The current match counts and whether results were invalidated or left stale.
+    // - The current match counts and whether the search was invalidated.
     SearchResults ControlCore::Search(const SearchRequest& request)
+    {
+        return _search(request, false).value();
+    }
+
+    // Method Description:
+    // - Refreshes search results after output has gone idle. A full rescan is skipped
+    //   once a growable buffer exceeds the bounded automatic-search limit.
+    // Return Value:
+    // - The current search results, or nullopt when the previous results became stale
+    //   and refreshing them would require an unbounded passive scan.
+    std::optional<SearchResults> ControlCore::SearchFromOutputIdle(const SearchRequest& request)
+    {
+        return _search(request, true);
+    }
+
+    std::optional<SearchResults> ControlCore::_search(const SearchRequest& request, const bool skipIfHistoryIsLarge)
     {
         const auto lock = _terminal->LockForWriting();
 
@@ -1782,7 +1798,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         WI_SetFlagIf(flags, SearchFlag::RegularExpression, request.RegularExpression);
         const auto searchInvalidated = _searcher.IsStale(*_terminal.get(), request.Text, flags);
         const auto& textBuffer = _terminal->GetTextBuffer();
-        const auto skipPassiveSearch = request.Origin == SearchRequestOrigin::OutputIdle &&
+        const auto skipPassiveSearch = skipIfHistoryIsLarge &&
                                        searchInvalidated &&
                                        textBuffer.IsGrowable() &&
                                        textBuffer.TotalRowCount() > _maximumRowsForPassiveSearch;
@@ -1803,13 +1819,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
             _terminal->SetSearchHighlightFocused(0);
             _renderer->TriggerSearchHighlight(oldResults);
 
-            return {
-                .TotalMatches = 0,
-                .CurrentMatch = 0,
-                .SearchInvalidated = true,
-                .SearchRegexInvalid = false,
-                .SearchResultsStale = true,
-            };
+            return std::nullopt;
         }
 
         if (searchInvalidated || request.ExecuteSearch)
@@ -1850,12 +1860,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
             currentMatch = gsl::narrow<int32_t>(idx);
         }
 
-        return {
+        return SearchResults{
             .TotalMatches = totalMatches,
             .CurrentMatch = currentMatch,
             .SearchInvalidated = searchInvalidated,
             .SearchRegexInvalid = !_searcher.IsOk(),
-            .SearchResultsStale = false,
         };
     }
 

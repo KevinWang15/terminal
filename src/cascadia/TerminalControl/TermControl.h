@@ -415,8 +415,13 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         void _Search(const winrt::hstring& text, const bool goForward, const bool caseSensitive, const bool regularExpression);
         void _SearchChanged(const winrt::hstring& text, const bool goForward, const bool caseSensitive, const bool regularExpression);
         void _CloseSearchBoxControl(const winrt::Windows::Foundation::IInspectable& sender, const Windows::UI::Xaml::RoutedEventArgs& args);
-        void _refreshSearch(SearchRequestOrigin origin);
-        void _handleSearchResults(SearchResults results);
+        enum class SearchRefreshReason
+        {
+            Explicit,
+            OutputIdle,
+        };
+        void _refreshSearch(SearchRefreshReason reason);
+        void _handleSearchResults(const std::optional<SearchResults>& results);
 
         void _hoveredHyperlinkChanged(const IInspectable& sender, const IInspectable& args);
         safe_void_coroutine _updateSelectionMarkers(IInspectable sender, Control::UpdateSelectionMarkersEventArgs args);
