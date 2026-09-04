@@ -211,9 +211,15 @@ public:
         Log::Comment(L"PlayMidiNote MOCK called...");
     }
 
-    void NotifyBufferRotation(const int /*delta*/) override
+    void NotifyBufferRotation(const int delta) override
     {
         Log::Comment(L"NotifyBufferRotation MOCK called...");
+        _bufferRotationDelta += delta;
+    }
+
+    void NotifyBufferCompaction(const int /*delta*/) override
+    {
+        Log::Comment(L"NotifyBufferCompaction MOCK called...");
     }
 
     void NotifyShellIntegrationMark() override
@@ -286,6 +292,7 @@ public:
 
         _response.clear();
         _retainResponse = false;
+        _bufferRotationDelta = 0;
     }
 
     void PrepCursor(CursorX xact, CursorY yact)
@@ -403,6 +410,7 @@ public:
     std::wstring_view _expectedWindowTitle{};
     bool _setCodePageResult = false;
     bool _expectedShowWindow = false;
+    int _bufferRotationDelta = 0;
 
     std::wstring _expectedMenuJson{};
     unsigned int _expectedReplaceLength = 0;
@@ -3025,6 +3033,25 @@ public:
         cursor.SetPosition({ 10, 0 });
         _pDispatch->LineFeed(DispatchTypes::LineFeedType::DependsOnMode);
         VERIFY_ARE_EQUAL(til::point(0, 1), cursor.GetPosition());
+
+        Log::Comment(L"Test 5: A growable buffer that cannot append falls back to rotation.");
+        _testGetSet->_textBuffer = std::make_unique<TextBuffer>(til::size{ 4, 2 }, TextAttribute{}, 0, false, &_testGetSet->_renderer, true);
+        _testGetSet->_viewport = { 0, 0, 4, 2 };
+        auto& boundedGrowableBuffer = *_testGetSet->_textBuffer;
+        auto& boundedCursor = boundedGrowableBuffer.GetCursor();
+        boundedCursor.SetPosition({ 0, 1 });
+
+        // A growable buffer rotates after its first failed allocation. Mimic
+        // that state so the next line feed observes GrowHeight returning false.
+        boundedGrowableBuffer.IncrementCircularBuffer();
+        VERIFY_ARE_EQUAL(til::CoordType{ 1 }, boundedGrowableBuffer.GetFirstRowIndex());
+
+        _pDispatch->LineFeed(DispatchTypes::LineFeedType::WithoutReturn);
+
+        VERIFY_ARE_EQUAL(til::CoordType{ 2 }, boundedGrowableBuffer.TotalRowCount());
+        VERIFY_ARE_EQUAL(til::CoordType{ 0 }, boundedGrowableBuffer.GetFirstRowIndex());
+        VERIFY_ARE_EQUAL((til::point{ 0, 1 }), boundedCursor.GetPosition());
+        VERIFY_ARE_EQUAL(1, _testGetSet->_bufferRotationDelta);
     }
 
     TEST_METHOD(SetConsoleTitleTest)

@@ -165,7 +165,7 @@ UINT s_LoadStringEx(_In_ HINSTANCE hModule, _In_ UINT wID, _Out_writes_(cchBuffe
 // -  Positive if First is to the right of the Second.
 // -  This is so you can do s_CompareCoords(first, second) <= 0 for "first is left or the same as second".
 //    (the < looks like a left arrow :D)
-// -  The magnitude of the result is the distance between the two coordinates when typing characters into the buffer (left to right, top to bottom)
+// -  The magnitude is the distance between the two coordinates, clamped to the range of an int.
 int Utils::s_CompareCoords(const til::size bufferSize, const til::point coordFirst, const til::point coordSecond) noexcept
 {
     const auto cRowWidth = bufferSize.width;
@@ -180,11 +180,11 @@ int Utils::s_CompareCoords(const til::size bufferSize, const til::point coordFir
     // First set the distance vertically
     //   If first is on row 4 and second is on row 6, first will be -2 rows behind second * an 80 character row would be -160.
     //   For the same row, it'll be 0 rows * 80 character width = 0 difference.
-    auto retVal = (coordFirst.y - coordSecond.y) * cRowWidth;
+    auto retVal = (til::HugeCoordType{ coordFirst.y } - coordSecond.y) * cRowWidth;
 
     // Now adjust for horizontal differences
     //   If first is in position 15 and second is in position 30, first is -15 left in relation to 30.
-    retVal += (coordFirst.x - coordSecond.x);
+    retVal += til::HugeCoordType{ coordFirst.x } - coordSecond.x;
 
     // Further notes:
     //   If we already moved behind one row, this will help correct for when first is right of second.
@@ -193,7 +193,7 @@ int Utils::s_CompareCoords(const til::size bufferSize, const til::point coordFir
     //     Step one will set the retVal as -80 as first is one row behind the second.
     //     Step two will then see that first is 79 - 0 = +79 right of second and add 79
     //     The total is -80 + 79 = -1.
-    return retVal;
+    return gsl::narrow_cast<int>(std::clamp<til::HugeCoordType>(retVal, INT_MIN, INT_MAX));
 }
 
 // Routine Description:
@@ -207,7 +207,7 @@ int Utils::s_CompareCoords(const til::size bufferSize, const til::point coordFir
 // -  Positive if First is to the right of the Second.
 // -  This is so you can do s_CompareCoords(first, second) <= 0 for "first is left or the same as second".
 //    (the < looks like a left arrow :D)
-// -  The magnitude of the result is the distance between the two coordinates when typing characters into the buffer (left to right, top to bottom)
+// -  The magnitude is the distance between the two coordinates, clamped to the range of an int.
 int Utils::s_CompareCoords(const til::point coordFirst, const til::point coordSecond) noexcept
 {
     const auto& gci = ServiceLocator::LocateGlobals().getConsoleInformation();

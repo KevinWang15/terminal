@@ -97,6 +97,13 @@ class TextBufferTests
     TEST_METHOD(TestGetLastNonSpaceCharacter);
 
     TEST_METHOD(TestIncrementCircularBuffer);
+    TEST_METHOD(TestFiniteBufferUsesContiguousStorage);
+    TEST_METHOD(TestDecommitReleasesPartialBlockTail);
+    TEST_METHOD(TestGrowableBufferCrossesStorageBlocks);
+    TEST_METHOD(TestGrowableHeightPublicationIsTransactional);
+    TEST_METHOD(TestGrowableReflowFailureIsReported);
+    TEST_METHOD(TestGrowableBufferClearReleasesStorageBlocks);
+    TEST_METHOD(TestGrowableMarkRowsAreIndexed);
 
     TEST_METHOD(TestMixedRgbAndLegacyForeground);
     TEST_METHOD(TestMixedRgbAndLegacyBackground);
@@ -151,6 +158,10 @@ class TextBufferTests
 
     TEST_METHOD(HyperlinkTrim);
     TEST_METHOD(NoHyperlinkTrim);
+    TEST_METHOD(HyperlinkIdsDoNotOverwriteLiveMappings);
+    TEST_METHOD(HyperlinkIdsReclaimUnreferencedMappings);
+    TEST_METHOD(ClearScrollbackPrunesHyperlinkMaps);
+    TEST_METHOD(ResetPrunesHyperlinkMaps);
 
     TEST_METHOD(ReflowPromptRegions);
 };
@@ -464,6 +475,295 @@ void TextBufferTests::TestIncrementCircularBuffer()
         // ensure old first row has been emptied
         VERIFY_IS_FALSE(FirstRow.ContainsText());
     }
+}
+
+void TextBufferTests::TestFiniteBufferUsesContiguousStorage()
+{
+    static constexpr til::CoordType height = 1000;
+    TextBuffer buffer{ { 80, height }, TextAttribute{}, 12, false, &_renderer };
+
+    VERIFY_ARE_EQUAL(size_t{ 1 }, buffer._rowBlocks.size());
+    VERIFY_ARE_EQUAL(gsl::narrow_cast<size_t>(height) + 1, buffer._rowBlocks.front().rowCount);
+    VERIFY_IS_TRUE(buffer._rowBlocks.front().allocation.get() == buffer._finiteRowStorage);
+    VERIFY_IS_TRUE(buffer._finiteRowStorage == buffer._rowStorage(0));
+    VERIFY_IS_TRUE(
+        buffer._rowBlocks.front().allocation.get() + gsl::narrow_cast<size_t>(height) * buffer._bufferRowStride ==
+        buffer._rowStorage(height));
+}
+
+void TextBufferTests::TestDecommitReleasesPartialBlockTail()
+{
+    TextBuffer buffer{ { 80, 300 }, TextAttribute{}, 12, false, &_renderer, true };
+    buffer.GetMutableRowByOffset(0).ReplaceCharacters(0, 1, { L"A" });
+    buffer.GetMutableRowByOffset(200).ReplaceCharacters(0, 1, { L"Z" });
+
+    SYSTEM_INFO systemInfo{};
+    GetSystemInfo(&systemInfo);
+    const auto pageMask = gsl::narrow_cast<size_t>(systemInfo.dwPageSize) - 1;
+    const auto retainedBytes = size_t{ 2 } * buffer._bufferRowStride; // scratchpad + row 0
+    const auto decommitOffset = (retainedBytes + pageMask) & ~pageMask;
+    const auto decommitAddress = buffer._rowBlocks.front().allocation.get() + decommitOffset;
+
+    MEMORY_BASIC_INFORMATION memory{};
+    VERIFY_IS_TRUE(VirtualQuery(decommitAddress, &memory, sizeof(memory)) != 0);
+    VERIFY_ARE_EQUAL(static_cast<DWORD>(MEM_COMMIT), memory.State);
+
+    buffer._decommit(1);
+
+    VERIFY_IS_TRUE(VirtualQuery(decommitAddress, &memory, sizeof(memory)) != 0);
+    VERIFY_ARE_EQUAL(static_cast<DWORD>(MEM_RESERVE), memory.State);
+    VERIFY_ARE_EQUAL(L'A', buffer.GetRowByOffset(0).GetText().front());
+
+    // Recommitting the tail can touch the page shared with the retained rows;
+    // verify that doing so neither corrupts those rows nor leaves stale data.
+    VERIFY_ARE_EQUAL(L' ', buffer.GetRowByOffset(200).GetText().front());
+    VERIFY_ARE_EQUAL(L'A', buffer.GetRowByOffset(0).GetText().front());
+}
+
+void TextBufferTests::TestGrowableBufferCrossesStorageBlocks()
+{
+    TextBuffer textBuffer{ { 8, 2 }, TextAttribute{}, 12, false, &_renderer, true };
+    const auto rowsPerBlock = gsl::narrow_cast<til::CoordType>(textBuffer._rowsPerBlock);
+    const auto targetHeight = rowsPerBlock * 2 + 2;
+
+    while (textBuffer.TotalRowCount() < targetHeight)
+    {
+        VERIFY_IS_TRUE(textBuffer.GrowHeight());
+    }
+
+    // The scratchpad occupies storage row zero, so these logical rows straddle
+    // both the first and second storage-block boundaries.
+    const std::array<std::pair<til::CoordType, wchar_t>, 5> samples = {
+        std::pair{ 0, L'A' },
+        std::pair{ rowsPerBlock - 2, L'B' },
+        std::pair{ rowsPerBlock - 1, L'C' },
+        std::pair{ rowsPerBlock * 2 - 1, L'D' },
+        std::pair{ targetHeight - 1, L'E' },
+    };
+
+    for (const auto& [rowIndex, value] : samples)
+    {
+        textBuffer.GetMutableRowByOffset(rowIndex).ReplaceCharacters(0, 1, { &value, 1 });
+    }
+
+    VERIFY_ARE_EQUAL(targetHeight, textBuffer.TotalRowCount());
+    VERIFY_ARE_EQUAL(0, textBuffer.GetFirstRowIndex());
+    VERIFY_IS_TRUE(textBuffer._rowBlocks.size() >= 3);
+    for (const auto& [rowIndex, value] : samples)
+    {
+        VERIFY_ARE_EQUAL(value, textBuffer.GetRowByOffset(rowIndex).GetText().front());
+    }
+}
+
+void TextBufferTests::TestGrowableHeightPublicationIsTransactional()
+{
+    TextBuffer buffer{ { 8, 2 }, TextAttribute{}, 12, false, &_renderer, true };
+
+    const auto originalHeight = buffer.TotalRowCount();
+    VERIFY_IS_TRUE(buffer.GrowHeight());
+    VERIFY_ARE_EQUAL(originalHeight + 1, buffer.TotalRowCount());
+
+    // Grow across a storage-block boundary in one transaction. The final
+    // logical row must already contain a live ROW before the target height is
+    // published, so resetting it cannot move the commit boundary.
+    const auto targetHeight = gsl::narrow_cast<til::CoordType>(buffer._rowsPerBlock) + 2;
+    VERIFY_IS_TRUE(buffer.TryGrowToHeight(targetHeight));
+    VERIFY_ARE_EQUAL(targetHeight, buffer.TotalRowCount());
+    VERIFY_IS_TRUE(buffer._committedRowCount > gsl::narrow_cast<size_t>(buffer.TotalRowCount()));
+    const auto committedAfterGrowth = buffer._committedRowCount;
+    buffer.ResetRow(buffer.TotalRowCount() - 1, TextAttribute{});
+    VERIFY_ARE_EQUAL(committedAfterGrowth, buffer._committedRowCount);
+
+    // Rejected preconditions are deterministic failure seams. They verify the
+    // same externally observable transaction boundary without claiming to
+    // inject an operating-system allocation failure.
+    const auto grownHeight = buffer.TotalRowCount();
+    const auto blockCount = buffer._rowBlocks.size();
+    const auto committedRowCount = buffer._committedRowCount;
+    buffer._firstRow = 1;
+    VERIFY_IS_FALSE(buffer.TryGrowToHeight(grownHeight + 1));
+    VERIFY_ARE_EQUAL(grownHeight, buffer.TotalRowCount());
+    VERIFY_ARE_EQUAL(blockCount, buffer._rowBlocks.size());
+    VERIFY_ARE_EQUAL(committedRowCount, buffer._committedRowCount);
+    buffer._firstRow = 0;
+
+    VERIFY_IS_FALSE(buffer.TryGrowToHeight(til::CoordTypeMax / 2 + 1));
+    VERIFY_ARE_EQUAL(grownHeight, buffer.TotalRowCount());
+    VERIFY_ARE_EQUAL(blockCount, buffer._rowBlocks.size());
+    VERIFY_ARE_EQUAL(committedRowCount, buffer._committedRowCount);
+}
+
+void TextBufferTests::TestGrowableReflowFailureIsReported()
+{
+    TextBuffer oldBuffer{ { 8, 2 }, TextAttribute{}, 12, false, &_renderer, true };
+    oldBuffer.GetMutableRowByOffset(0).ReplaceCharacters(0, 8, std::wstring_view{ L"ABCDEFGH" });
+
+    // A rotated growable buffer cannot append. Use that state as a lightweight
+    // failure seam: narrowing this row needs four destination rows, so Reflow
+    // must report the failed growth instead of returning a partial buffer.
+    TextBuffer newBuffer{ { 2, 2 }, TextAttribute{}, 12, false, &_renderer, true };
+    newBuffer._firstRow = 1;
+
+    VERIFY_THROWS_SPECIFIC(TextBuffer::Reflow(oldBuffer, newBuffer),
+                           wil::ResultException,
+                           [](wil::ResultException& exception) { return exception.GetErrorCode() == E_OUTOFMEMORY; });
+
+    VERIFY_ARE_EQUAL(til::CoordType{ 2 }, oldBuffer.TotalRowCount());
+    VERIFY_ARE_EQUAL(std::wstring_view{ L"ABCDEFGH" }, oldBuffer.GetRowByOffset(0).GetText());
+    VERIFY_ARE_EQUAL(til::CoordType{ 2 }, newBuffer.TotalRowCount());
+}
+
+void TextBufferTests::TestGrowableBufferClearReleasesStorageBlocks()
+{
+    TextBuffer textBuffer{ { 8, 2 }, TextAttribute{}, 12, false, &_renderer, true };
+    const auto rowsPerBlock = gsl::narrow_cast<til::CoordType>(textBuffer._rowsPerBlock);
+    const auto targetHeight = rowsPerBlock * 2 + 2;
+
+    while (textBuffer.TotalRowCount() < targetHeight)
+    {
+        VERIFY_IS_TRUE(textBuffer.GrowHeight());
+    }
+
+    textBuffer.GetMutableRowByOffset(targetHeight - 1).ReplaceCharacters(0, 1, { L"Z" });
+    const auto discardedHyperlink = textBuffer.GetHyperlinkId(L"discarded.url", L"");
+    const auto retainedHyperlink = textBuffer.GetHyperlinkId(L"retained.url", L"");
+    TextAttribute hyperlinkAttributes;
+    hyperlinkAttributes.SetHyperlinkId(discardedHyperlink);
+    textBuffer.GetMutableRowByOffset(0).SetAttrToEnd(0, hyperlinkAttributes);
+    hyperlinkAttributes.SetHyperlinkId(retainedHyperlink);
+    textBuffer.GetMutableRowByOffset(targetHeight - 1).SetAttrToEnd(0, hyperlinkAttributes);
+    textBuffer.AddHyperlinkToMap(L"discarded.url", discardedHyperlink);
+    textBuffer.AddHyperlinkToMap(L"retained.url", retainedHyperlink);
+    VERIFY_IS_TRUE(textBuffer._rowBlocks.size() >= 3);
+
+    textBuffer.ClearScrollback(targetHeight - 2, 2);
+
+    VERIFY_ARE_EQUAL(2, textBuffer.TotalRowCount());
+    VERIFY_ARE_EQUAL(size_t{ 1 }, textBuffer._rowBlocks.size());
+    VERIFY_ARE_EQUAL(L'Z', textBuffer.GetRowByOffset(1).GetText().front());
+    VERIFY_ARE_EQUAL(textBuffer._hyperlinkMap.end(), textBuffer._hyperlinkMap.find(discardedHyperlink));
+    VERIFY_ARE_EQUAL(std::wstring{ L"retained.url" }, textBuffer.GetHyperlinkUriFromId(retainedHyperlink));
+    VERIFY_IS_TRUE(textBuffer.GrowHeight());
+    VERIFY_ARE_EQUAL(3, textBuffer.TotalRowCount());
+}
+
+void TextBufferTests::TestGrowableMarkRowsAreIndexed()
+{
+    TextBuffer buffer{ { 8, 4 }, TextAttribute{}, 12, false, &_renderer, true };
+    while (buffer.TotalRowCount() < 6)
+    {
+        VERIFY_IS_TRUE(buffer.GrowHeight());
+    }
+
+    const ScrollbarData warningMark{ .category = MarkCategory::Warning };
+    const ScrollbarData errorMark{ .category = MarkCategory::Error };
+    buffer.SetScrollbarData(warningMark, 1);
+    buffer.SetScrollbarData(errorMark, 5);
+
+    auto marks = buffer.GetMarkRows();
+    VERIFY_ARE_EQUAL(size_t{ 2 }, marks.size());
+    VERIFY_ARE_EQUAL(til::CoordType{ 1 }, marks[0].row);
+    VERIFY_IS_TRUE(MarkCategory::Warning == marks[0].data.category);
+    VERIFY_ARE_EQUAL(til::CoordType{ 5 }, marks[1].row);
+    VERIFY_IS_TRUE(MarkCategory::Error == marks[1].data.category);
+
+    // Copying a row copies its scrollbar data, while copying an unmarked row
+    // over a marked row clears both the data and its index entry.
+    buffer.CopyRow(5, 3, buffer);
+    buffer.CopyRow(2, 5, buffer);
+
+    marks = buffer.GetMarkRows();
+    VERIFY_ARE_EQUAL(size_t{ 2 }, marks.size());
+    VERIFY_ARE_EQUAL(til::CoordType{ 1 }, marks[0].row);
+    VERIFY_ARE_EQUAL(til::CoordType{ 3 }, marks[1].row);
+    VERIFY_ARE_EQUAL(size_t{ 2 }, buffer._scrollMarkRows.size());
+
+    buffer.SetScrollbarData(errorMark, 4);
+    buffer.ClearMarksInRange({ 0, 4 }, { 7, 4 });
+    VERIFY_ARE_EQUAL(size_t{ 2 }, buffer._scrollMarkRows.size());
+
+    // This row is outside the retained range. Clearing growable scrollback
+    // rebuilds the sparse index from retained rows and must not leave it stale.
+    buffer.SetScrollbarData(warningMark, 5);
+    VERIFY_ARE_EQUAL(size_t{ 3 }, buffer._scrollMarkRows.size());
+
+    buffer.ClearScrollback(1, 3);
+
+    marks = buffer.GetMarkRows();
+    VERIFY_ARE_EQUAL(size_t{ 2 }, marks.size());
+    VERIFY_ARE_EQUAL(til::CoordType{ 0 }, marks[0].row);
+    VERIFY_IS_TRUE(MarkCategory::Warning == marks[0].data.category);
+    VERIFY_ARE_EQUAL(til::CoordType{ 2 }, marks[1].row);
+    VERIFY_IS_TRUE(MarkCategory::Error == marks[1].data.category);
+    VERIFY_ARE_EQUAL(size_t{ 2 }, buffer._scrollMarkRows.size());
+
+    buffer.ResetRow(2, TextAttribute{});
+    VERIFY_IS_FALSE(buffer.GetRowByOffset(2).GetScrollbarData().has_value());
+    VERIFY_ARE_EQUAL(size_t{ 1 }, buffer._scrollMarkRows.size());
+    VERIFY_ARE_EQUAL(til::CoordType{ 0 }, buffer._scrollMarkRows.front());
+
+    buffer.Reset();
+    VERIFY_IS_TRUE(buffer.GetMarkRows().empty());
+    VERIFY_IS_TRUE(buffer._scrollMarkRows.empty());
+
+    // Finite buffers retain the existing scan and do not need an index.
+    TextBuffer finiteBuffer{ { 8, 4 }, TextAttribute{}, 12, false, &_renderer };
+    finiteBuffer.SetScrollbarData(warningMark, 2);
+    marks = finiteBuffer.GetMarkRows();
+    VERIFY_ARE_EQUAL(size_t{ 1 }, marks.size());
+    VERIFY_ARE_EQUAL(til::CoordType{ 2 }, marks[0].row);
+
+    TextBuffer commandBuffer{ { 8, 4 }, TextAttribute{}, 12, false, &_renderer, true };
+    TextAttribute promptAttributes;
+    promptAttributes.SetMarkAttributes(MarkKind::Prompt);
+    TextAttribute commandAttributes;
+    commandAttributes.SetMarkAttributes(MarkKind::Command);
+
+    commandBuffer.Write(OutputCellIterator{ L"$ ", promptAttributes }, { 0, 1 });
+    commandBuffer.Write(OutputCellIterator{ L"one", commandAttributes }, { 2, 1 });
+    commandBuffer.SetScrollbarData(warningMark, 1);
+
+    commandBuffer.Write(OutputCellIterator{ L"$ ", promptAttributes }, { 0, 3 });
+    commandBuffer.Write(OutputCellIterator{ L"two", commandAttributes }, { 2, 3 });
+    commandBuffer.SetScrollbarData(errorMark, 3);
+    commandBuffer.GetCursor().SetPosition({ 5, 3 });
+
+    VERIFY_ARE_EQUAL(std::wstring{ L"two" }, commandBuffer.CurrentCommand());
+    const std::vector<std::wstring> expectedCommands{ L"one", L"two" };
+    VERIFY_ARE_EQUAL(expectedCommands, commandBuffer.Commands());
+    const auto latestMark = commandBuffer.GetMarkExtents(1);
+    VERIFY_ARE_EQUAL(size_t{ 1 }, latestMark.size());
+    VERIFY_IS_TRUE(MarkCategory::Error == latestMark.front().data.category);
+
+    commandBuffer.EndCurrentCommand(7);
+    const auto& endedMark = commandBuffer.GetRowByOffset(3).GetScrollbarData();
+    VERIFY_IS_TRUE(endedMark.has_value());
+    VERIFY_ARE_EQUAL(uint32_t{ 7 }, endedMark->exitCode.value());
+
+    TextBuffer oldBuffer{ { 8, 2 }, TextAttribute{}, 12, false, &_renderer, true };
+    oldBuffer.GetMutableRowByOffset(1).ReplaceCharacters(0, 1, { L"X" });
+    oldBuffer.SetScrollbarData(errorMark, 1);
+    TextBuffer reflowedBuffer{ { 4, 2 }, TextAttribute{}, 12, false, &_renderer, true };
+    TextBuffer::Reflow(oldBuffer, reflowedBuffer);
+
+    marks = reflowedBuffer.GetMarkRows();
+    VERIFY_ARE_EQUAL(size_t{ 1 }, marks.size());
+    VERIFY_ARE_EQUAL(til::CoordType{ 1 }, marks[0].row);
+    VERIFY_IS_TRUE(MarkCategory::Error == marks[0].data.category);
+
+    TextBuffer nonstandardOldBuffer{ { 8, 2 }, TextAttribute{}, 12, false, &_renderer, true };
+    auto& nonstandardRow = nonstandardOldBuffer.GetMutableRowByOffset(1);
+    nonstandardRow.ReplaceCharacters(0, 1, { L"X" });
+    nonstandardRow.SetLineRendition(LineRendition::DoubleWidth);
+    nonstandardOldBuffer.SetScrollbarData(errorMark, 1);
+    TextBuffer nonstandardReflowedBuffer{ { 4, 2 }, TextAttribute{}, 12, false, &_renderer, true };
+    TextBuffer::Reflow(nonstandardOldBuffer, nonstandardReflowedBuffer);
+
+    marks = nonstandardReflowedBuffer.GetMarkRows();
+    VERIFY_ARE_EQUAL(size_t{ 1 }, marks.size());
+    VERIFY_ARE_EQUAL(til::CoordType{ 1 }, marks[0].row);
+    VERIFY_IS_TRUE(MarkCategory::Error == marks[0].data.category);
+    VERIFY_ARE_EQUAL(size_t{ 1 }, nonstandardReflowedBuffer._scrollMarkRows.size());
 }
 
 void TextBufferTests::TestMixedRgbAndLegacyForeground()
@@ -2683,6 +2983,109 @@ void TextBufferTests::NoHyperlinkTrim()
     // The hyperlink reference should not be deleted from the map since it is still present in the buffer
     VERIFY_ARE_EQUAL(_buffer->GetHyperlinkUriFromId(id), url);
     VERIFY_ARE_EQUAL(_buffer->_hyperlinkCustomIdMap[finalCustomId], id);
+}
+
+void TextBufferTests::HyperlinkIdsDoNotOverwriteLiveMappings()
+{
+    const til::size bufferSize{ 80, 10 };
+    auto buffer = std::make_unique<TextBuffer>(bufferSize, TextAttribute{}, 12, false, &_renderer);
+
+    buffer->AddHyperlinkToMap(L"last.url", UINT16_MAX);
+    buffer->AddHyperlinkToMap(L"first.url", 1);
+    buffer->_currentHyperlinkId = UINT16_MAX;
+
+    const auto id = buffer->GetHyperlinkId(L"next.url", L"");
+    VERIFY_ARE_EQUAL(uint16_t{ 2 }, id);
+    buffer->AddHyperlinkToMap(L"next.url", id);
+
+    VERIFY_ARE_EQUAL(std::wstring{ L"last.url" }, buffer->GetHyperlinkUriFromId(UINT16_MAX));
+    VERIFY_ARE_EQUAL(std::wstring{ L"first.url" }, buffer->GetHyperlinkUriFromId(1));
+    VERIFY_ARE_EQUAL(std::wstring{ L"next.url" }, buffer->GetHyperlinkUriFromId(2));
+}
+
+void TextBufferTests::HyperlinkIdsReclaimUnreferencedMappings()
+{
+    const til::size bufferSize{ 80, 10 };
+    auto buffer = std::make_unique<TextBuffer>(bufferSize, TextAttribute{}, 12, false, &_renderer);
+
+    for (uint32_t value = 1; value <= UINT16_MAX; ++value)
+    {
+        buffer->AddHyperlinkToMap(L"unreferenced.url", gsl::narrow_cast<uint16_t>(value));
+    }
+    TextAttribute liveAttributes;
+    liveAttributes.SetHyperlinkId(1);
+    buffer->GetMutableRowByOffset(0).SetAttrToEnd(0, liveAttributes);
+    liveAttributes.SetHyperlinkId(2);
+    buffer->SetCurrentAttributes(liveAttributes);
+    buffer->_currentHyperlinkId = UINT16_MAX;
+
+    const auto id = buffer->GetHyperlinkId(L"next.url", L"");
+    VERIFY_ARE_EQUAL(gsl::narrow_cast<uint16_t>(UINT16_MAX), id);
+    VERIFY_ARE_EQUAL(size_t{ 2 }, buffer->_hyperlinkMap.size());
+    VERIFY_ARE_EQUAL(std::wstring{ L"unreferenced.url" }, buffer->GetHyperlinkUriFromId(1));
+    VERIFY_ARE_EQUAL(std::wstring{ L"unreferenced.url" }, buffer->GetHyperlinkUriFromId(2));
+
+    buffer->AddHyperlinkToMap(L"next.url", id);
+    VERIFY_ARE_EQUAL(std::wstring{ L"next.url" }, buffer->GetHyperlinkUriFromId(id));
+}
+
+void TextBufferTests::ClearScrollbackPrunesHyperlinkMaps()
+{
+    TextBuffer buffer{ { 8, 4 }, TextAttribute{}, 12, false, &_renderer, true };
+    TextAttribute hyperlinkAttributes;
+
+    const auto discardedId1 = buffer.GetHyperlinkId(L"discarded1.url", L"discarded1");
+    buffer.AddHyperlinkToMap(L"discarded1.url", discardedId1);
+    const auto discardedId2 = buffer.GetHyperlinkId(L"discarded2.url", L"discarded2");
+    buffer.AddHyperlinkToMap(L"discarded2.url", discardedId2);
+    const auto retainedId = buffer.GetHyperlinkId(L"retained.url", L"retained");
+    buffer.AddHyperlinkToMap(L"retained.url", retainedId);
+    const auto activeId = buffer.GetHyperlinkId(L"active.url", L"active");
+    buffer.AddHyperlinkToMap(L"active.url", activeId);
+    hyperlinkAttributes.SetHyperlinkId(retainedId);
+    buffer.GetMutableRowByOffset(3).SetAttrToEnd(0, hyperlinkAttributes);
+    hyperlinkAttributes.SetHyperlinkId(activeId);
+    buffer.SetCurrentAttributes(hyperlinkAttributes);
+
+    buffer.ClearScrollback(2, 2);
+
+    VERIFY_ARE_EQUAL(size_t{ 2 }, buffer._hyperlinkMap.size());
+    VERIFY_ARE_EQUAL(size_t{ 2 }, buffer._hyperlinkCustomIdMap.size());
+    VERIFY_ARE_EQUAL(std::wstring{ L"retained.url" }, buffer.GetHyperlinkUriFromId(retainedId));
+    VERIFY_ARE_EQUAL(retainedId, buffer.GetHyperlinkId(L"retained.url", L"retained"));
+    VERIFY_ARE_EQUAL(std::wstring{ L"active.url" }, buffer.GetHyperlinkUriFromId(activeId));
+    VERIFY_ARE_EQUAL(buffer._hyperlinkMap.end(), buffer._hyperlinkMap.find(discardedId1));
+    VERIFY_ARE_EQUAL(buffer._hyperlinkMap.end(), buffer._hyperlinkMap.find(discardedId2));
+}
+
+void TextBufferTests::ResetPrunesHyperlinkMaps()
+{
+    TextBuffer buffer{ { 8, 4 }, TextAttribute{}, 12, false, &_renderer, true };
+
+    const auto discardedId = buffer.GetHyperlinkId(L"discarded.url", L"discarded");
+    buffer.AddHyperlinkToMap(L"discarded.url", discardedId);
+    const auto activeId = buffer.GetHyperlinkId(L"active.url", L"active");
+    buffer.AddHyperlinkToMap(L"active.url", activeId);
+    auto attributes = buffer.GetCurrentAttributes();
+    attributes.SetHyperlinkId(activeId);
+    buffer.SetCurrentAttributes(attributes);
+
+    buffer.Reset();
+
+    VERIFY_ARE_EQUAL(size_t{ 1 }, buffer._hyperlinkMap.size());
+    VERIFY_ARE_EQUAL(size_t{ 1 }, buffer._hyperlinkCustomIdMap.size());
+    VERIFY_ARE_EQUAL(std::wstring{ L"active.url" }, buffer.GetHyperlinkUriFromId(activeId));
+    VERIFY_ARE_EQUAL(activeId, buffer.GetHyperlinkId(L"active.url", L"active"));
+    VERIFY_ARE_EQUAL(buffer._hyperlinkMap.end(), buffer._hyperlinkMap.find(discardedId));
+
+    attributes.SetHyperlinkId(0);
+    buffer.SetCurrentAttributes(attributes);
+    buffer.ClearScrollback(1, 0);
+
+    VERIFY_IS_TRUE(buffer._hyperlinkMap.empty());
+    VERIFY_IS_TRUE(buffer._hyperlinkCustomIdMap.empty());
+    VERIFY_ARE_EQUAL(uint16_t{ 1 }, buffer._currentHyperlinkId);
+    VERIFY_IS_FALSE(buffer.GetRowByOffset(0).GetAttrByColumn(0).IsHyperlink());
 }
 
 #define FTCS_A L"\x1b]133;A\x1b\\"

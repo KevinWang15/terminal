@@ -159,6 +159,7 @@ public:
 
     bool IsVtInputEnabled() const noexcept override;
     void NotifyBufferRotation(const int delta) override;
+    void NotifyBufferCompaction(const int delta) override;
     void NotifyShellIntegrationMark() override;
 
     void InvokeCompletions(std::wstring_view menuJson, unsigned int replaceLength) override;
@@ -412,6 +413,7 @@ private:
     std::unique_ptr<TextBuffer> _altBuffer;
     Microsoft::Console::Types::Viewport _mutableViewport;
     til::CoordType _scrollbackLines = 0;
+    bool _infiniteScrollback = false;
     bool _detectURLs = false;
     bool _clipboardOperationsAllowed = true;
 
@@ -465,6 +467,7 @@ private:
     Microsoft::Console::Types::Viewport _GetVisibleViewport() const noexcept;
 
     void _PreserveUserScrollOffset(const int viewportDelta) noexcept;
+    void _RebaseSelection(const int delta);
     til::CoordType _ScrollToPoints(const til::point coordStart, const til::point coordEnd);
 
     void _NotifyScrollEvent();

@@ -22,6 +22,7 @@ constexpr auto DEFAULT_FOREGROUND = COLOR_WHITE;
 constexpr auto DEFAULT_BACKGROUND = COLOR_BLACK;
 
 constexpr short DEFAULT_HISTORY_SIZE = 9001;
+constexpr int32_t UNLIMITED_HISTORY_SIZE = -1;
 
 #pragma warning(push)
 #pragma warning(disable : 26426)

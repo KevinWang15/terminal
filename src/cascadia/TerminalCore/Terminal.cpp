@@ -43,12 +43,13 @@ Terminal::Terminal(TestDummyMarker) :
 void Terminal::Create(til::size viewportSize, til::CoordType scrollbackLines, Renderer& renderer)
 {
     _mutableViewport = Viewport::FromDimensions({ 0, 0 }, viewportSize);
-    _scrollbackLines = scrollbackLines;
+    _infiniteScrollback = scrollbackLines == UNLIMITED_HISTORY_SIZE;
+    _scrollbackLines = _infiniteScrollback ? 0 : Utils::ClampToShortMax(scrollbackLines, 0);
     const til::size bufferSize{ viewportSize.width,
-                                Utils::ClampToShortMax(viewportSize.height + scrollbackLines, 1) };
+                                Utils::ClampToShortMax(viewportSize.height + _scrollbackLines, 1) };
     const TextAttribute attr{};
     const UINT cursorSize = 12;
-    _mainBuffer = std::make_unique<TextBuffer>(bufferSize, attr, cursorSize, true, &renderer);
+    _mainBuffer = std::make_unique<TextBuffer>(bufferSize, attr, cursorSize, true, &renderer, _infiniteScrollback);
 
     auto dispatch = std::make_unique<AdaptDispatch>(*this, &renderer, _renderSettings, _terminalInput);
     auto engine = std::make_unique<OutputStateMachineEngine>(std::move(dispatch));
@@ -78,8 +79,8 @@ void Terminal::CreateFromSettings(ICoreSettings settings,
     const til::size viewportSize{ Utils::ClampToShortMax(settings.InitialCols(), 1),
                                   Utils::ClampToShortMax(settings.InitialRows(), 1) };
 
-    // TODO:MSFT:20642297 - Support infinite scrollback here, if HistorySize is -1
-    Create(viewportSize, Utils::ClampToShortMax(settings.HistorySize(), 0), renderer);
+    const auto historySize = settings.HistorySize();
+    Create(viewportSize, historySize == UNLIMITED_HISTORY_SIZE ? UNLIMITED_HISTORY_SIZE : Utils::ClampToShortMax(historySize, 0), renderer);
 
     UpdateSettings(settings);
 }
@@ -315,7 +316,62 @@ try
         return S_OK;
     }
 
-    const auto newBufferHeight = std::clamp(viewportSize.height + _scrollbackLines, 1, SHRT_MAX);
+    // Changing only the viewport height cannot alter line wrapping. In an
+    // unlimited buffer, all rows have stable coordinates and can therefore be
+    // kept in place instead of copying the entire history into a second
+    // buffer. This is particularly important for terminals with very deep
+    // scrollback, where a routine window-height change would otherwise be
+    // proportional to every row retained so far.
+    if (_infiniteScrollback && viewportSize.width == oldDimensions.width)
+    {
+        const auto originalOffsetWasZero = _scrollOffset == 0;
+        const auto originalVisibleTop = _VisibleStartIndex();
+        const auto cursorPos = _mainBuffer->GetCursor().GetPosition();
+        const auto lastChar = _mainBuffer->GetLastNonSpaceCharacter(&_mutableViewport);
+        const auto maxRow = std::max(lastChar.y, cursorPos.y);
+
+        // A newly enlarged viewport may be taller than the initial buffer.
+        // Prepare every missing row before publishing the new buffer height,
+        // so an allocation failure leaves the existing state unchanged.
+        if (!_mainBuffer->TryGrowToHeight(viewportSize.height))
+        {
+            return E_OUTOFMEMORY;
+        }
+
+        // Match the vertical placement used by the reflow path. Shrinking
+        // keeps the old top unless that would leave the cursor or final text
+        // below the viewport. Growing expands upward when there is retained
+        // history available.
+        const auto proposedTopFromLastLine = maxRow - viewportSize.height + 1;
+        auto proposedTop = std::max(_mutableViewport.Top(), proposedTopFromLastLine);
+        proposedTop = std::max(0, proposedTop);
+
+        const auto proposedView = Viewport::FromDimensions({ 0, proposedTop }, viewportSize);
+        const auto proposedBottom = proposedView.BottomExclusive();
+        const auto actualBufferHeight = _mainBuffer->GetSize().Height();
+        if (proposedBottom > actualBufferHeight)
+        {
+            proposedTop = ::base::ClampSub(proposedTop, ::base::ClampSub(proposedBottom, actualBufferHeight));
+        }
+
+        // The mutable viewport must always contain the cursor.
+        proposedTop = std::min(proposedTop, cursorPos.y);
+        _mutableViewport = Viewport::FromDimensions({ 0, proposedTop }, viewportSize);
+
+        const auto newVisibleTop = std::clamp(originalVisibleTop, 0, _mutableViewport.Top());
+        _scrollOffset = originalOffsetWasZero ? 0 : static_cast<int>(::base::ClampSub(_mutableViewport.Top(), newVisibleTop));
+
+        _mainBuffer->TriggerRedrawAll();
+        _NotifyScrollEvent();
+        return S_OK;
+    }
+
+    // A growable buffer starts at the viewport height. Reflow appends exactly
+    // as many rows as the retained logical content needs, which also releases
+    // rows made redundant by widening the terminal.
+    const auto newBufferHeight = _infiniteScrollback ?
+                                     viewportSize.height :
+                                     std::clamp(viewportSize.height + _scrollbackLines, 1, SHRT_MAX);
     const til::size bufferSize{ viewportSize.width, newBufferHeight };
 
     // If the original buffer had _no_ scroll offset, then we should be at the
@@ -330,7 +386,8 @@ try
                                                       TextAttribute{},
                                                       0,
                                                       _mainBuffer->IsActiveBuffer(),
-                                                      _mainBuffer->GetRenderer());
+                                                      _mainBuffer->GetRenderer(),
+                                                      _infiniteScrollback);
 
     // Build a PositionInformation to track the position of both the top of
     // the mutable viewport and the top of the visible viewport in the new
@@ -444,9 +501,10 @@ try
     // top up so that we'll still fit within the buffer.
     const auto newView = Viewport::FromDimensions({ 0, proposedTop }, viewportSize);
     const auto proposedBottom = newView.BottomExclusive();
-    if (proposedBottom > bufferSize.height)
+    const auto actualBufferHeight = newTextBuffer->GetSize().Height();
+    if (proposedBottom > actualBufferHeight)
     {
-        proposedTop = ::base::ClampSub(proposedTop, ::base::ClampSub(proposedBottom, bufferSize.height));
+        proposedTop = ::base::ClampSub(proposedTop, ::base::ClampSub(proposedBottom, actualBufferHeight));
     }
 
     // Keep the cursor in the mutable viewport
@@ -1552,8 +1610,11 @@ void Terminal::ColorSelection(const TextAttribute& attr, winrt::Microsoft::Termi
 {
     const auto colorSelection = [this](const til::point coordStartInclusive, const til::point coordEndExclusive, const TextAttribute& attr) {
         auto& textBuffer = _activeBuffer();
-        const auto spanLength = textBuffer.GetSize().CompareInBounds(coordEndExclusive, coordStartInclusive, true);
-        textBuffer.Write(OutputCellIterator(attr, spanLength), coordStartInclusive);
+        const auto spanLength = textBuffer.GetSize().GetCellDistance(coordStartInclusive, coordEndExclusive, true);
+        if (spanLength > 0)
+        {
+            textBuffer.Write(OutputCellIterator(attr, gsl::narrow<size_t>(spanLength)), coordStartInclusive);
+        }
     };
 
     for (const auto [start, end] : _GetSelectionSpans())

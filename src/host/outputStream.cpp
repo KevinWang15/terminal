@@ -446,6 +446,10 @@ void ConhostInternalGetSet::NotifyBufferRotation(const int)
 {
 }
 
+void ConhostInternalGetSet::NotifyBufferCompaction(const int)
+{
+}
+
 void ConhostInternalGetSet::NotifyShellIntegrationMark()
 {
     // Not implemented for conhost - shell integration marks are a Terminal app feature.

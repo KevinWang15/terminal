@@ -68,6 +68,7 @@ public:
     bool IsVtInputEnabled() const override;
 
     void NotifyBufferRotation(const int delta) override;
+    void NotifyBufferCompaction(const int delta) override;
     void NotifyShellIntegrationMark() override;
 
     void InvokeCompletions(std::wstring_view menuJson, unsigned int replaceLength) override;

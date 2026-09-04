@@ -388,30 +388,49 @@ void Terminal::ShowNotification(const std::wstring_view title, const std::wstrin
     }
 }
 
+void Terminal::_RebaseSelection(const int delta)
+{
+    // Keep the selection attached to its text when buffer rows move upward.
+    if (!_selection->active)
+    {
+        return;
+    }
+
+    const til::point firstRetainedCell{ 0, delta };
+    const auto selectionDiscarded = _selection->blockSelection ?
+                                        _selection->end.y < delta :
+                                        _selection->end <= firstRetainedCell;
+
+    // ClearSelection also resets the keyboard/mark-mode bookkeeping. Do this
+    // before acquiring a COW write guard, because ClearSelection writes the
+    // same state itself. Linear selections are half-open, so a selection that
+    // ends exactly at the cutoff contains no retained cells.
+    if (selectionDiscarded)
+    {
+        ClearSelection();
+        return;
+    }
+
+    auto selection{ _selection.write() };
+    wil::hide_name _selection;
+    const auto pivotWasStart = selection->start == selection->pivot;
+    if (!selection->blockSelection && selection->start < firstRetainedCell)
+    {
+        // A linear selection crossing the cutoff must begin at the first cell,
+        // not at the discarded row's original column.
+        selection->start = {};
+    }
+    else
+    {
+        selection->start.y = std::max(selection->start.y - delta, 0);
+    }
+    selection->end.y = std::max(selection->end.y - delta, 0);
+    selection->pivot = pivotWasStart ? selection->start : selection->end;
+}
+
 void Terminal::NotifyBufferRotation(const int delta)
 {
-    // Update our selection, so it doesn't move as the buffer is cycled
-    if (_selection->active)
-    {
-        auto selection{ _selection.write() };
-        wil::hide_name _selection;
-        // If the end of the selection will be out of range after the move, we just
-        // clear the selection. Otherwise, we move both the start and end points up
-        // by the given delta and clamp to the first row.
-        if (selection->end.y < delta)
-        {
-            selection->active = false;
-        }
-        else
-        {
-            // Stash this, so we can make sure to update the pivot to match later.
-            const auto pivotWasStart = selection->start == selection->pivot;
-            selection->start.y = std::max(selection->start.y - delta, 0);
-            selection->end.y = std::max(selection->end.y - delta, 0);
-            // Make sure to sync the pivot with whichever value is the right one.
-            selection->pivot = pivotWasStart ? selection->start : selection->end;
-        }
-    }
+    _RebaseSelection(delta);
 
     // manually erase our pattern intervals since the locations have changed now
     _patternIntervalTree = {};
@@ -419,6 +438,30 @@ void Terminal::NotifyBufferRotation(const int delta)
     const auto oldScrollOffset = _scrollOffset;
     _PreserveUserScrollOffset(delta);
     if (_scrollOffset != oldScrollOffset || AlwaysNotifyOnBufferRotation())
+    {
+        _NotifyScrollEvent();
+    }
+}
+
+void Terminal::NotifyBufferCompaction(const int delta)
+{
+    const auto hadSelection = IsSelectionActive();
+    _RebaseSelection(delta);
+    if (hadSelection)
+    {
+        _activeBuffer().TriggerSelection();
+    }
+
+    // Compaction changes the absolute coordinates of every retained row.
+    _patternIntervalTree = {};
+
+    // Unlike circular rotation, compaction can reduce the physical buffer
+    // height. Keep the user scroll offset within the history that still exists
+    // so subsequent output cannot preserve an offset into discarded rows.
+    const auto oldScrollOffset = _scrollOffset;
+    const auto maximumScrollOffset = std::max(0, _GetMutableViewport().Top());
+    _scrollOffset = std::clamp(_scrollOffset, 0, maximumScrollOffset);
+    if (_scrollOffset != oldScrollOffset)
     {
         _NotifyScrollEvent();
     }

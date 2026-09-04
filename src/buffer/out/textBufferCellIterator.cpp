@@ -280,7 +280,7 @@ TextBufferCellIterator TextBufferCellIterator::operator-(const ptrdiff_t& moveme
 ptrdiff_t TextBufferCellIterator::operator-(const TextBufferCellIterator& it)
 {
     THROW_HR_IF(E_NOT_VALID_STATE, &_buffer != &it._buffer); // It's not valid to compare this for iterators pointing at different buffers.
-    return _bounds.CompareInBounds(_pos, it._pos);
+    return gsl::narrow<ptrdiff_t>(_bounds.GetCellDistance(it._pos, _pos));
 }
 
 // Routine Description:

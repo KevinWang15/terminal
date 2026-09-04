@@ -56,6 +56,7 @@ namespace Microsoft::Console::Types
         bool DecrementInBounds(til::point& pos, bool allowEndExclusive = false) const noexcept;
         bool IncrementInExclusiveBounds(til::point& pos) const noexcept;
         bool DecrementInExclusiveBounds(til::point& pos) const noexcept;
+        til::HugeCoordType GetCellDistance(const til::point from, const til::point to, bool allowEndExclusive = false) const noexcept;
         int CompareInBounds(const til::point first, const til::point second, bool allowEndExclusive = false) const noexcept;
         int CompareInExclusiveBounds(const til::point first, const til::point second) const noexcept;
 

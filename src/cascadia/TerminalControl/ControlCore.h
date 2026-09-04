@@ -224,6 +224,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         void SetEndSelectionPoint(const til::point position);
 
         SearchResults Search(const SearchRequest& request);
+        std::optional<SearchResults> SearchFromOutputIdle(const SearchRequest& request);
         const std::vector<til::point_span>& SearchResultRows() const noexcept;
         void ClearSearch();
 
@@ -321,6 +322,7 @@ namespace winrt::Microsoft::Terminal::Control::implementation
 
         void _handleControlC();
         void _sendInputToConnection(std::wstring_view wstr);
+        std::optional<SearchResults> _search(const SearchRequest& request, bool skipIfHistoryIsLarge);
 
 #pragma region TerminalCoreCallbacks
         void _terminalWarningBell();
@@ -418,6 +420,11 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         til::point _contextMenuBufferPosition{ 0, 0 };
         Windows::Foundation::Collections::IVector<hstring> _cachedQuickFixes{ nullptr };
         ::Search _searcher;
+        std::optional<til::point_span> _staleSearchAnchor;
+        // Passive refreshes should never cost more than searching the largest
+        // traditional finite buffer. Searches explicitly requested by the user
+        // are always allowed to inspect the full retained history.
+        static constexpr til::CoordType _maximumRowsForPassiveSearch = 32'767;
         std::optional<interval_tree::IntervalTree<til::point, size_t>::interval> _lastHoveredInterval;
         std::optional<wchar_t> _leadingSurrogate;
         std::optional<til::point> _lastHoveredCell;
